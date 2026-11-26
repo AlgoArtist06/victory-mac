@@ -4,7 +4,10 @@
 #import <Metal/Metal.h>
 #include <mach/mach.h>
 #include <pthread.h>
+#include <cpuid.h>
+#include <immintrin.h>
 #include <signal.h>
+#include <sys/wait.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -66,6 +69,40 @@ static void pages_and_guards(void) {
     munmap(m, 1 << 20);
 }
 
+// The title is built for Zen 2 and uses AVX2 without asking. Rosetta
+// translates AVX2; CPUID shows it only with ROSETTA_ADVERTISE_AVX=1.
+__attribute__((target("avx2"))) static void masked_store(int32_t *p) {
+    __m256i mask = _mm256_set_epi32(0, 0, 0, 0, 0, 0, 0, -1);
+    _mm256_maskstore_epi32(p, mask, _mm256_set1_epi32(7));
+}
+static void cpu(void) {
+    unsigned a, b, c, d;
+    __get_cpuid(1, &a, &b, &c, &d);
+    int avx = c >> 28 & 1, fma = c >> 12 & 1, f16c = c >> 29 & 1;
+    __get_cpuid_count(7, 0, &a, &b, &c, &d);
+    int avx2 = b >> 5 & 1, bmi2 = b >> 8 & 1;
+    printf("info CPUID: AVX %d AVX2 %d FMA %d F16C %d BMI2 %d (ROSETTA_ADVERTISE_AVX=%s)\n", avx, avx2, fma, f16c, bmi2,
+           getenv("ROSETTA_ADVERTISE_AVX") ? getenv("ROSETTA_ADVERTISE_AVX") : "unset");
+    int32_t *m = mmap(0, 8192, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    masked_store(m);
+    CHECK(m[0] == 7 && m[1] == 0, "AVX2 masked store runs");
+
+    // A masked store into a write-guarded page, in a child: under Wine this
+    // stopped the title with a Rosetta error.
+    pid_t child = fork();
+    if (child == 0) {
+        mprotect(m, 4096, PROT_READ);
+        faults = 0;
+        masked_store(m + 4);
+        _exit(faults == 1 && m[4] == 7 ? 0 : 3);
+    }
+    int status = 0;
+    waitpid(child, &status, 0);
+    printf("info AVX2 masked store into a guarded page: %s\n",
+           WIFEXITED(status) && WEXITSTATUS(status) == 0 ? "fault handled, store landed"
+           : WIFSIGNALED(status) ? "process killed (Rosetta cannot resume it)" : "handled wrongly");
+}
+
 // PE images are mapped at their preferred base when it is free.
 static void fixed_address(void) {
     void *want = (void *)0x140000000;
@@ -120,8 +157,8 @@ static void thread_block(void) {
 // (as title memory would be), with no copy.
 static void unified_memory(void) {
     id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
-    CHECK(dev != nil, "Metal device: %s, unified %d, max working set %.2f GB", dev.name.UTF8String,
-          dev.hasUnifiedMemory, dev.recommendedMaxWorkingSetSize / 1e9);
+    CHECK(dev != nil, "Metal device: %s, unified %d, max working set %.2f GB, max buffer %.2f GB", dev.name.UTF8String,
+          dev.hasUnifiedMemory, dev.recommendedMaxWorkingSetSize / 1e9, dev.maxBufferLength / 1e9);
     size_t len = 64 << 20;
     uint32_t *mem = mmap(0, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     for (size_t i = 0; i < len / 4; i++) mem[i] = (uint32_t)i;
@@ -160,6 +197,7 @@ int main(void) {
 #endif
     @autoreleasepool {
         pages_and_guards();
+        cpu();
         fixed_address();
         thread_block();
         unified_memory();
