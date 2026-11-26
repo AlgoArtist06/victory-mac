@@ -1,3 +1,18 @@
+diff --git a/crates/victory-gpu/src/watch.rs b/crates/victory-gpu/src/watch.rs
+index 70b9fb0..3eea553 100644
+--- a/crates/victory-gpu/src/watch.rs
++++ b/crates/victory-gpu/src/watch.rs
+@@ -687,6 +687,10 @@ fn spread_each<T: Send>(n: usize, each: impl Fn(usize) -> T + Sync) -> Vec<T> {
+ /// memory of one reservation. The caller holds the range ([`Asking`]).
+ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
+     use windows_sys::Win32::System::Memory::GetWriteWatch;
++    // WINE-PROOF-ONLY: without write watch every page counts as written.
++    if std::env::var_os("VICTORY_NO_WRITE_WATCH").is_some() {
++        return Some((first..last).map(|page| (page, u16::MAX)).collect());
++    }
+     const WRITE_WATCH_FLAG_RESET: u32 = 1;
+     FOUND.with(|found| {
+         let mut found = found.borrow_mut();
 diff --git a/crates/victory-hle/src/modules/files.rs b/crates/victory-hle/src/modules/files.rs
 index 9a06b4b..fa3bc83 100644
 --- a/crates/victory-hle/src/modules/files.rs
