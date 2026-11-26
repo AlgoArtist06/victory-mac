@@ -23,49 +23,61 @@
 
 #[cfg(windows)]
 mod console_insn;
+#[cfg(windows)]
 mod crash;
+#[cfg(target_os = "macos")]
+mod crash_macos;
 #[cfg(windows)]
 pub mod descriptor_sites;
 pub mod frame_rate;
+#[cfg(any(windows, target_os = "macos"))]
+mod images;
+#[cfg(target_os = "macos")]
+mod macos;
 pub mod prepare;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod profile;
+#[cfg(windows)]
 pub(crate) mod publish;
 pub mod resolution;
 pub mod resolve;
 #[cfg(all(windows, feature = "diagnostics"))]
-mod profile;
-#[cfg(all(windows, feature = "diagnostics"))]
 mod stacks;
 #[cfg(windows)]
 mod threads;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 mod thunks;
 #[cfg(windows)]
 mod tls;
 #[cfg(windows)]
-pub mod write_sites;
-#[cfg(windows)]
 mod windows;
+#[cfg(windows)]
+pub mod write_sites;
 
+#[cfg(all(windows, feature = "diagnostics"))]
+pub use crash::save_on_crash;
 #[cfg(windows)]
 pub use crash::{
     locate, log_crash, log_crashes_to, note_title_output, report_crashes, report_unhandled,
 };
-#[cfg(all(windows, feature = "diagnostics"))]
-pub use crash::save_on_crash;
+#[cfg(target_os = "macos")]
+pub use crash_macos::log_crash;
+#[cfg(any(windows, target_os = "macos"))]
+pub use images::{BindReport, MissingImport, WithTitleDlls, load_title_dll, load_title_dlls};
+#[cfg(target_os = "macos")]
+pub use macos::{LoadedImage, enter_thread, load};
 pub use prepare::{PrepareError, PreparedImage, prepare};
+#[cfg(all(windows, feature = "diagnostics"))]
+pub use profile::profile_on_schedule;
 pub use resolve::{ImportResolver, Provenance, Resolution};
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use stacks::{dump_stacks, dump_stacks_on_schedule};
-#[cfg(all(windows, feature = "diagnostics"))]
-pub use profile::profile_on_schedule;
 #[cfg(windows)]
 pub use threads::{disable_thread_calls, set_before_thread_shutdown};
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 pub use thunks::{UnimplementedPolicy, unimplemented_call_count};
 #[cfg(windows)]
-pub use windows::{
-    BindReport, LoadedImage, MissingImport, WithTitleDlls, load, load_title_dll, load_title_dlls,
-};
+pub use windows::{LoadedImage, load};
 
 /// `DLL_PROCESS_ATTACH`, for TLS callbacks.
 pub const DLL_PROCESS_ATTACH: u32 = 1;

@@ -15,13 +15,6 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Result, bail};
-use windows_sys::Win32::System::Diagnostics::Debug::{
-    DebugBreak, FlushInstructionCache, IsDebuggerPresent,
-};
-use windows_sys::Win32::System::Memory::{
-    MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READWRITE, VirtualAlloc, VirtualProtect,
-};
-use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
 /// What an unimplemented import does when called.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -67,8 +60,12 @@ extern "win64" fn unimplemented_import(site: &'static ImportSite) -> u64 {
             let (dll, symbol) = (&site.dll, &site.symbol);
             let text = format!("VIctory: unimplemented import {dll}!{symbol} called");
             crate::log_crash(&text);
+            #[cfg(windows)]
             // SAFETY: plain Win32 calls without preconditions.
             unsafe {
+                use windows_sys::Win32::System::Diagnostics::Debug::{
+                    DebugBreak, IsDebuggerPresent,
+                };
                 if IsDebuggerPresent() != 0 {
                     DebugBreak();
                 }
@@ -91,21 +88,7 @@ impl ThunkBlock {
     /// Reserves room for `count` stubs (writable until [`Self::seal`]).
     pub(crate) fn new(count: usize) -> Result<Self> {
         let len = (count.max(1) * THUNK_SIZE).next_multiple_of(4096);
-        // SAFETY: fresh anonymous allocation; no existing memory is touched.
-        let base = unsafe {
-            VirtualAlloc(
-                std::ptr::null(),
-                len,
-                MEM_COMMIT | MEM_RESERVE,
-                PAGE_READWRITE,
-            )
-        } as *mut u8;
-        if base.is_null() {
-            bail!(
-                "VirtualAlloc for import stubs failed: {}",
-                std::io::Error::last_os_error()
-            );
-        }
+        let base = memory::alloc_rw(len)?;
         Ok(ThunkBlock { base, len, used: 0 })
     }
 
@@ -134,22 +117,99 @@ impl ThunkBlock {
     /// Makes the block read+execute. The block is intentionally leaked:
     /// title code may hold these addresses for the life of the process.
     pub(crate) fn seal(self) -> Result<()> {
-        let mut old = 0;
         // SAFETY: `base..base+len` is the allocation made in `new`.
-        let ok = unsafe { VirtualProtect(self.base as _, self.len, PAGE_EXECUTE_READ, &mut old) };
-        if ok == 0 {
+        unsafe { memory::make_rx(self.base, self.len) }
+    }
+}
+
+/// Executable memory for generated code, per OS.
+mod memory {
+    use anyhow::{Result, bail};
+
+    /// A fresh read+write allocation of `len` bytes.
+    #[cfg(windows)]
+    pub(super) fn alloc_rw(len: usize) -> Result<*mut u8> {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+        };
+        // SAFETY: fresh anonymous allocation; no existing memory is touched.
+        let base = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                len,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_READWRITE,
+            )
+        };
+        if base.is_null() {
+            bail!(
+                "VirtualAlloc for import stubs failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        Ok(base.cast())
+    }
+
+    /// Makes `base..base+len` read+execute.
+    ///
+    /// # Safety
+    /// `base..base+len` is an allocation from [`alloc_rw`].
+    #[cfg(windows)]
+    pub(super) unsafe fn make_rx(base: *mut u8, len: usize) -> Result<()> {
+        use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
+        use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READ, VirtualProtect};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let mut old = 0;
+        // SAFETY: guaranteed by the caller.
+        if unsafe { VirtualProtect(base.cast(), len, PAGE_EXECUTE_READ, &mut old) } == 0 {
             bail!(
                 "VirtualProtect for import stubs failed: {}",
                 std::io::Error::last_os_error()
             );
         }
-        // SAFETY: flushing our own process's instruction cache for our own block.
-        unsafe { FlushInstructionCache(GetCurrentProcess(), self.base as _, self.len) };
+        // SAFETY: our own process and block.
+        unsafe { FlushInstructionCache(GetCurrentProcess(), base.cast(), len) };
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    pub(super) fn alloc_rw(len: usize) -> Result<*mut u8> {
+        // SAFETY: fresh anonymous mapping; no existing memory is touched.
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        if base == libc::MAP_FAILED {
+            bail!(
+                "mmap for import stubs failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        Ok(base.cast())
+    }
+
+    /// # Safety
+    /// `base..base+len` is an allocation from [`alloc_rw`].
+    #[cfg(unix)]
+    pub(super) unsafe fn make_rx(base: *mut u8, len: usize) -> Result<()> {
+        // SAFETY: guaranteed by the caller. x86-64 needs no cache flush.
+        if unsafe { libc::mprotect(base.cast(), len, libc::PROT_READ | libc::PROT_EXEC) } != 0 {
+            bail!(
+                "mprotect for import stubs failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
         Ok(())
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod tests {
     use super::*;
 

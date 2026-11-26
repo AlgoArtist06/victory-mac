@@ -46,6 +46,17 @@ Under Wine, `victory run` maps the title and its four DLLs and binds every impor
 
 The "Host" column is what the native port has to provide itself.
 
+With drawing off (`VICTORY_NO_DRAWS=1`, Series S profile, write watch off), the title ran 7 min 21 s without a crash.
+Its frame loop presented 12,874 frames, a locked 30 per second in 403 of the 418 seconds.
+The picture is black, so the scene is not known; it is likely an intro or loading phase.
+The process's physical footprint grew from 357 MB to 2.1 GB in the first minute, then by about 150 MB a minute to 3.04 GB.
+Swap stayed at about 1 GB.
+This includes the memory the title allocates for its GPU resources, but not our pipelines, render targets or host GPU copies.
+
+Two problems are Wine's, not the title's:
+`GetLogicalDrives` never returns inside this process under this Wine build,
+and Wine imitates write watch with read-only pages, so a fault inside an AVX2 masked store stops the process with a Rosetta error.
+
 ## Steps
 
 Each step ends with a check that runs on the Mac.
@@ -59,6 +70,7 @@ Each step ends with a check that runs on the Mac.
    Check: the Windows build is unchanged, and the macOS build compiles them.
 4. Loader: map PE images ourselves, apply relocations, give the title TLS index 0 through `gs:0x58`, and bind imports.
    Check: `victory run` on macOS prints the same bind table as the Wine run.
+   Done: `cargo run --target x86_64-apple-darwin -p victory-loader --example mac_load -- <title folder>` maps the title at 0x140000000 with TLS index 0, binds 72 imports between the title's images, leaves exactly the Wine run's runtime + host imports to provide (515, 198, 60, 57, 22), and a second copy moves all 598,281 relocations correctly.
 5. Host layer: the Windows functions in the "Host" column, on POSIX and Mach, plus structured exception handling from the images' unwind tables.
    Check: the title runs with `VICTORY_NO_DRAWS=1` and a null GPU, and its memory is measured.
 6. Metal back end over unified memory: title GPU memory is a few no-copy Metal buffers, so a GPU address is the CPU address plus that buffer's offset.

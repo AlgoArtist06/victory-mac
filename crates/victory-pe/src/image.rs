@@ -437,6 +437,32 @@ fn va_to_rva(va: u64, image_base: u64) -> Result<u32, PeError> {
         .ok_or_else(|| PeError::Malformed(format!("VA 0x{va:x} is outside the image")))
 }
 
+/// RVAs of the image's 64-bit base relocations: the places that hold an
+/// address at the preferred base and move with the image.
+pub fn base_relocations(data: &[u8]) -> Result<Vec<u32>, PeError> {
+    let file = PeFile64::parse(data)?;
+    let sections = file.section_table();
+    let mut rvas = Vec::new();
+    let Some(mut blocks) = file.data_directories().relocation_blocks(data, &sections)? else {
+        return Ok(rvas);
+    };
+    while let Some(block) = blocks.next()? {
+        for reloc in block {
+            match reloc.typ {
+                pe::IMAGE_REL_BASED_ABSOLUTE => {}
+                pe::IMAGE_REL_BASED_DIR64 => rvas.push(reloc.virtual_address),
+                other => {
+                    return Err(PeError::Unsupported(format!(
+                        "base relocation type {other} at {:#x}",
+                        reloc.virtual_address
+                    )));
+                }
+            }
+        }
+    }
+    Ok(rvas)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
