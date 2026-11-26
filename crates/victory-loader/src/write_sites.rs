@@ -321,7 +321,7 @@ mod tests {
     #[test]
     fn a_changed_write_does_what_it_did() {
         use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, VirtualAlloc, VirtualProtect};
-        type F = unsafe extern "system" fn(*mut u8, *mut [u64; 3]);
+        type F = unsafe extern "win64" fn(*mut u8, *mut [u64; 3]);
         for (constant, with) in [(0x80u8, 0x49u8), (1, 0x49), (0x7f, 0x49), (0xff, 0x48), (0x10, 0x49)] {
             // mov rax, rcx ; mov r9, rcx ; mov rcx, 1234h ; xor r10, r10 ; or byte [r9+31h | rax+31h], constant ;
             // pushfq ; pop r10 ; mov [rdx], r10 ; mov [rdx+8], rax ; mov [rdx+16], rcx ; ret
@@ -394,7 +394,7 @@ mod tests {
             (&[0xc4, 0xc1, 0x7c, 0x11, 0x41, 0x40], 32),            // vmovups [r9+40h], ymm0
             (&[0xc4, 0xc1, 0x7e, 0x7f, 0x49, 0x40], 32),            // vmovdqu [r9+40h], ymm1
         ];
-        type F = unsafe extern "system" fn(*mut u8, u64, *mut u8);
+        type F = unsafe extern "win64" fn(*mut u8, u64, *mut u8);
         for &(store, size) in stores {
             let mut code = vec![0x41, 0x55, 0x49, 0x89, 0xc9, 0x4d, 0x31, 0xd2, 0x49, 0x89, 0xd5]; // push r13 ; r9 = rcx ; r10 = 0 ; r13 = rdx
             code.extend([0x48, 0xc7, 0xc1, 0x34, 0x12, 0, 0]); // mov rcx, 1234h
@@ -469,7 +469,7 @@ mod tests {
             data.add(0x31).write(0x83);
             let mut old = 0;
             VirtualProtect(data.cast(), 4096, PAGE_READONLY, &mut old);
-            let f: unsafe extern "system" fn(*mut u8) = std::mem::transmute(place);
+            let f: unsafe extern "win64" fn(*mut u8) = std::mem::transmute(place);
             f(data);
             assert_eq!(data.add(0x31).read(), 0x83);
         }

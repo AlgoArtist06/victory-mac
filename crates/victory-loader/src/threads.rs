@@ -247,9 +247,9 @@ pub fn disable_thread_calls(base: usize) -> Option<bool> {
 /// any other callback linked into the exe.
 #[used]
 #[unsafe(link_section = ".CRT$XLAV")]
-static ON_THREAD: unsafe extern "system" fn(*mut c_void, u32, *mut c_void) = on_thread;
+static ON_THREAD: unsafe extern "win64" fn(*mut c_void, u32, *mut c_void) = on_thread;
 
-unsafe extern "system" fn on_thread(_: *mut c_void, reason: u32, _: *mut c_void) {
+unsafe extern "win64" fn on_thread(_: *mut c_void, reason: u32, _: *mut c_void) {
     if reason != DLL_THREAD_ATTACH && reason != DLL_THREAD_DETACH {
         return;
     }

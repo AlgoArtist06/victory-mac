@@ -578,7 +578,7 @@ mod tests {
                 let now = std::slice::from_raw_parts(page.add(6), 7);
                 assert_eq!(now, [0x0f, 0x1f, 0x00, 0xf3, 0x90, 0x90, 0xc3]);
                 // They run now.
-                let run: extern "system" fn() = std::mem::transmute(page.add(6));
+                let run: extern "win64" fn() = std::mem::transmute(page.add(6));
                 run();
                 // A second thread that faulted at the same place meanwhile.
                 assert!(patch(at + 6, [0x0f, 0x01, 0xfa], [0x0f, 0x1f, 0x00]));
@@ -633,7 +633,7 @@ mod tests {
                 if patches_clzero() {
                     assert_eq!(*((page + 16) as *const u8), 0xe9, "a jump");
                     block.fill(0xaa);
-                    let run: extern "system" fn(usize, usize) -> usize = std::mem::transmute(page);
+                    let run: extern "win64" fn(usize, usize) -> usize = std::mem::transmute(page);
                     // From inside a line to inside the third: whole lines, one past the end.
                     assert_eq!(run(first + 8, first + 130), first + 8 + 128);
                     let at = first - base;

@@ -259,7 +259,7 @@ mod tests {
             code.extend(lea); // lea rax, [base+index]
             code.extend([0x5b, 0x5f, 0x5e]); // pop rbx ; pop rdi ; pop rsi
             code.extend([0xc5, 0xf8, 0x77, 0xc3]); // vzeroupper ; ret
-            type F = unsafe extern "system" fn(u64, *mut u8, *const u8, *mut u8) -> u64;
+            type F = unsafe extern "win64" fn(u64, *mut u8, *const u8, *mut u8) -> u64;
             // SAFETY: fresh memory for code and data, one copy changed before it runs.
             unsafe {
                 let place = VirtualAlloc(std::ptr::null(), 0x10000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) as usize;

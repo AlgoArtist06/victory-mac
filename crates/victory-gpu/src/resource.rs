@@ -945,8 +945,8 @@ pub(crate) struct Memory {
     attributes: Option<u64>,
 }
 
-pub type AllocRoutine = extern "system" fn(usize, u64) -> *mut c_void;
-pub type FreeRoutine = extern "system" fn(*mut c_void, u64);
+pub type AllocRoutine = extern "win64" fn(usize, u64) -> *mut c_void;
+pub type FreeRoutine = extern "win64" fn(*mut c_void, u64);
 static ALLOCATOR: std::sync::OnceLock<(AllocRoutine, FreeRoutine)> = std::sync::OnceLock::new();
 
 /// Committed resources get their memory from the title's general
