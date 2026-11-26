@@ -234,6 +234,7 @@ mod tests {
         assert_eq!(path, nested);
     }
 
+    #[cfg(windows)] // uses Windows threads and files
     #[test]
     fn serves_a_drive_over_the_title_folder_and_its_quota() {
         type Size = extern "win64" fn(This, *mut usize) -> HRESULT;

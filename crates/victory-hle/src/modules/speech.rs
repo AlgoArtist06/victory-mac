@@ -126,6 +126,7 @@ mod tests {
     use crate::modules::xgameruntime::method;
 
     #[test]
+    #[cfg_attr(not(windows), ignore = "needs the macOS host layer (mac/README.md, step 5)")]
     fn streams_are_empty_wave_files() {
         let this: This = &OBJECT;
         type Create = extern "win64" fn(This, *mut *const u8) -> HRESULT;

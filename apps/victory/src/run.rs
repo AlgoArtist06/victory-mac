@@ -35,7 +35,7 @@ fn check_cpu_features() -> Result<()> {
     check_cpu_features_with(has_avx2, skip.as_deref())
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 pub fn run(
     exe: &Path,
     unimplemented: Unimplemented,
@@ -47,10 +47,16 @@ pub fn run(
     use victory_hle::{HleResolver, HostPolicy};
     use victory_loader::{BindReport, UnimplementedPolicy, WithTitleDlls};
 
+    #[cfg(windows)]
     if execute {
         check_cpu_features()?;
     }
+    #[cfg(not(windows))]
+    if execute {
+        anyhow::bail!("executing titles on macOS needs the host layer (mac/README.md, step 5)");
+    }
     // A title that relaunched itself: the old process must be gone first.
+    #[cfg(windows)]
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
@@ -97,9 +103,12 @@ pub fn run(
         title.storage_bytes >> 20
     );
     // The console's fixed drives: the package as `G:`, temporary files `T:`.
-    victory_hle::modules::files::mount_at('G', title_dir);
     let temp = cfg.data_subdir(&format!("{:08X}/temp", title.id))?;
-    victory_hle::modules::files::mount_at('T', &temp);
+    #[cfg(windows)]
+    {
+        victory_hle::modules::files::mount_at('G', title_dir);
+        victory_hle::modules::files::mount_at('T', &temp);
+    }
     victory_hle::runtime::set_title(victory_hle::runtime::Title { storage, ..title });
     victory_hle::console::set(match console {
         Console::SeriesX => victory_hle::console::Console::SeriesX,
@@ -163,6 +172,7 @@ pub fn run(
     }
     let exe_name = exe.file_name().unwrap_or_default().to_string_lossy();
     show(&exe_name, image.bind_imports(&with_dlls, policy)?);
+    #[cfg(windows)]
     if execute {
         let size = image.info().size_of_image as usize;
         // SAFETY: the image stays mapped, and nothing of it has run yet.
@@ -176,9 +186,19 @@ pub fn run(
         let size = image.info().size_of_image as usize;
         // SAFETY: the image stays mapped, nothing of it has run yet, and the
         // marks are a static.
-        let done = unsafe { apply(image.base(), size, victory_hle::port_descriptors::marks_address(), &SITES) };
+        let done = unsafe {
+            apply(
+                image.base(),
+                size,
+                victory_hle::port_descriptors::marks_address(),
+                &SITES,
+            )
+        };
         let patched = done.iter().filter(|d| **d == Hooked::Done).count();
-        println!("renderer port 2: {patched} of {} descriptor record stores of the title patched", SITES.len());
+        println!(
+            "renderer port 2: {patched} of {} descriptor record stores of the title patched",
+            SITES.len()
+        );
         victory_hle::port_descriptors::hooked(image.base(), size, patched);
     }
     // The frame rate (VICTORY_FRAME_INTERVAL_MS, off without it): our frame
@@ -201,7 +221,9 @@ pub fn run(
                     title_interval_us(rate, false)
                 );
             }
-            None => println!("frame rate: our clock {ms} ms; the title's own rate (30) left as it is"),
+            None => {
+                println!("frame rate: our clock {ms} ms; the title's own rate (30) left as it is")
+            }
         }
     }
     // The output size and render scale (VICTORY_OUTPUT, VICTORY_RENDER_SCALE,
@@ -216,31 +238,36 @@ pub fn run(
         println!("not executing (pass --execute to start the title)");
         return Ok(());
     }
-    victory_loader::report_crashes();
-    victory_loader::set_before_thread_shutdown(victory_hle::known_pipelines::flush);
-    victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
-    victory_hle::runtime::use_console_timers();
-    #[cfg(feature = "diagnostics")]
-    diagnostics(&image, &cfg);
-    let late = LateDlls {
-        host: resolver.host.clone(),
-        title_dir: title_dir.to_owned(),
-        cache_dir: images,
-        policy,
-        mapped: std::sync::Mutex::new(dlls.clone()),
-        lock: LoaderLock::default(),
-    };
-    victory_hle::runtime::set_title_dll_loader(Box::new(move |file| {
-        late.load(file, show).map_err(|e| format!("{e:#}"))
-    }));
-    // SAFETY: imports are bound; from here on we run title code.
-    let main = unsafe { Arc::new(image).spawn_main(dlls)? };
-    let code = main
-        .join()
-        .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
-    victory_hle::known_pipelines::flush();
-    println!("title exited with {code}");
-    Ok(())
+    #[cfg(windows)]
+    {
+        victory_loader::report_crashes();
+        victory_loader::set_before_thread_shutdown(victory_hle::known_pipelines::flush);
+        victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
+        victory_hle::runtime::use_console_timers();
+        #[cfg(feature = "diagnostics")]
+        diagnostics(&image, &cfg);
+        let late = LateDlls {
+            host: resolver.host.clone(),
+            title_dir: title_dir.to_owned(),
+            cache_dir: images,
+            policy,
+            mapped: std::sync::Mutex::new(dlls.clone()),
+            lock: LoaderLock::default(),
+        };
+        victory_hle::runtime::set_title_dll_loader(Box::new(move |file| {
+            late.load(file, show).map_err(|e| format!("{e:#}"))
+        }));
+        // SAFETY: imports are bound; from here on we run title code.
+        let main = unsafe { Arc::new(image).spawn_main(dlls)? };
+        let code = main
+            .join()
+            .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
+        victory_hle::known_pipelines::flush();
+        println!("title exited with {code}");
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    unreachable!("macOS stops before executing (checked above)")
 }
 
 /// The debugging aids (README): scheduled stack dumps, watched values and
@@ -310,7 +337,11 @@ fn timers(base: usize, size: usize) {
     if std::env::var("VICTORY_TIMER_LOG").ok().as_deref() != Some("1") {
         return;
     }
-    if TIMERS.iter().chain([&FRAME_US, &LIMITER_ON]).any(|&rva| rva + 0x14 > size) {
+    if TIMERS
+        .iter()
+        .chain([&FRAME_US, &LIMITER_ON])
+        .any(|&rva| rva + 0x14 > size)
+    {
         return;
     }
     std::thread::spawn(move || {
@@ -325,7 +356,12 @@ fn timers(base: usize, size: usize) {
                 .iter()
                 .map(|&t| {
                     let step = f32::from_bits(u32_at(t + 0xc));
-                    format!("{} {} {step:.4} {}", u32_at(t), u32_at(t + 4), u32_at(t + 0x10))
+                    format!(
+                        "{} {} {step:.4} {}",
+                        u32_at(t),
+                        u32_at(t + 4),
+                        u32_at(t + 0x10)
+                    )
                 })
                 .collect();
             eprintln!(
@@ -369,7 +405,7 @@ fn poke(base: usize, size: usize) {
 }
 
 /// DLLs the host or our runtime provide are never taken from the title.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn title_dll(host: &victory_hle::HostPolicy, dll: &str) -> bool {
     !host.allows(dll) && !victory_hle::registry().iter().any(|m| m.serves(dll))
 }
@@ -377,7 +413,7 @@ fn title_dll(host: &victory_hle::HostPolicy, dll: &str) -> bool {
 /// The DLLs among `imported` (the main image's static imports) that must
 /// come from the title's folder (`wanted`) but were not mapped from it:
 /// none of their imports can be bound. Each named once, case ignored.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "macos", test))]
 fn absent_title_dlls(
     imported: &[&str],
     mapped: &[&str],
@@ -615,7 +651,7 @@ mod cpu_check_tests {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console) -> Result<()> {
     anyhow::bail!("running titles requires Windows")
 }

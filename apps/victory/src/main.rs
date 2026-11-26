@@ -9,6 +9,7 @@ mod inspect;
 mod replay;
 mod run;
 mod shader;
+#[cfg(windows)]
 mod translate;
 #[cfg(windows)]
 mod warm;
@@ -79,6 +80,7 @@ enum Command {
     /// VICTORY_HOST_MAX_WAVE is a compatibility alias. When both values are
     /// valid, VICTORY_HOST_WAVE takes precedence. Zero means unknown width.
     /// For ordinary translation, VICTORY_HOST_RDNA=1 selects RDNA float settings.
+    #[cfg(windows)]
     Translate {
         paths: Vec<PathBuf>,
         /// Check emitted DXIL with dxil.dll's validator (`VICTORY_DXIL`,
@@ -107,6 +109,7 @@ enum Command {
     /// of the translator. Translations an earlier build of the same version
     /// cached are made again, and those that came out different counted.
     /// In diagnostics builds, VICTORY_LOG=debug shows skipped paths.
+    #[cfg(windows)]
     Shaders {
         paths: Vec<PathBuf>,
         /// Worker threads (default: every logical core).
@@ -204,6 +207,7 @@ fn main() -> Result<()> {
             verbose,
             disasm,
         } => shader::run(paths, verbose || disasm, disasm),
+        #[cfg(windows)]
         Command::Translate {
             paths,
             validate,
@@ -213,7 +217,10 @@ fn main() -> Result<()> {
             warm,
         } => {
             // `VICTORY_VIEW_LIMIT=<null slot>`: translate as on a host whose view heap is capped
-            if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT").ok().and_then(|v| v.parse().ok()) {
+            if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+            {
                 victory_shader::emit::set_view_heap_limit(n);
             }
             let wave = translate::host_wave::select(
@@ -226,9 +233,16 @@ fn main() -> Result<()> {
             }
             translate::run(paths, validate, pipelines, list, jobs, wave)
         }
+        #[cfg(windows)]
         Command::Shaders { paths, jobs, list } => translate::precompile(paths, jobs, list),
         #[cfg(windows)]
-        Command::Warm { jobs, limit, again, used, these } => warm::run(jobs, limit, again, used, these),
+        Command::Warm {
+            jobs,
+            limit,
+            again,
+            used,
+            these,
+        } => warm::run(jobs, limit, again, used, these),
         Command::Run {
             exe,
             unimplemented,

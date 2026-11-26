@@ -1998,17 +1998,27 @@ impl ValueWait {
         if self.address == 0 {
             return true;
         }
-        static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *ASK.get_or_init(|| std::env::var_os("VICTORY_WAIT_ASK").is_some_and(|v| v == "1"))
-            && !crate::texture::committed(self.address as *const u8, bytes)
-        {
-            return true;
-        }
         // The low `bytes` bytes; the rest stays zero.
         let mut raw = [0u8; 8];
-        if !crate::host::read_into(self.address as *const u8, &mut raw[..bytes]) {
-            return true;
+        #[cfg(windows)]
+        {
+            static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *ASK.get_or_init(|| std::env::var_os("VICTORY_WAIT_ASK").is_some_and(|v| v == "1"))
+                && !crate::texture::committed(self.address as *const u8, bytes)
+            {
+                return true;
+            }
+            if !crate::host::read_into(self.address as *const u8, &mut raw[..bytes]) {
+                return true;
+            }
         }
+        // ponytail: a plain read of the title's memory; a fault-safe read like
+        // Windows' comes with the host layer.
+        #[cfg(not(windows))]
+        // SAFETY: the title's own fence address, mapped while it waits on it.
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.address as *const u8, raw.as_mut_ptr(), bytes)
+        };
         self.holds_for(u64::from_le_bytes(raw))
     }
 
