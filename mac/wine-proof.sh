@@ -1,7 +1,7 @@
 #!/bin/sh
 # Proof run under Wine (data only, not the target): runs the Windows build of
 # victory on the title with drawing off and logs memory every 5 seconds.
-# Usage: mac/wine-proof.sh <seconds> [victory run arguments...]
+# Usage: mac/wine-proof.sh <seconds, at most 300> [victory run arguments...]
 # Needs: the Windows build (x86_64-pc-windows-gnullvm) with mac/wine-proof.patch
 # applied (Wine-only workarounds: GetLogicalDrives never returns in this
 # process under Wine 11, and Wine's write watch faults stop Rosetta inside
@@ -9,6 +9,8 @@
 # VICTORY_NO_DRAWS=0 draws.
 set -u
 SECS=$1; shift
+# Every run lasts at most 5 minutes.
+[ "$SECS" -gt 300 ] && SECS=300
 OUT=${OUT:-/Volumes/victory-dev/proof}
 RT=${RT:-/Volumes/xo/dist/runtimes/d3dmetal-4.0b3}
 GAME=${GAME:-/Volumes/T7/alpha/GTA6.Xbox.v1.0.2.1/GTA6.Xbox.v1.0.2.1}
