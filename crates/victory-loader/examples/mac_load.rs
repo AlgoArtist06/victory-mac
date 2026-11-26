@@ -41,14 +41,26 @@ fn main() -> Result<()> {
     );
 
     // The host's own C++ runtime serves these on Windows (HostPolicy).
-    let wanted = |dll: &str| !dll.starts_with("msvcp140") && !dll.starts_with("vcruntime140");
+    // `MAC_LOAD_CXX=title`: map the C++ runtime the title ships instead.
+    let cxx_from_title = std::env::var("MAC_LOAD_CXX").is_ok_and(|v| v == "title");
+    let wanted = |dll: &str| {
+        cxx_from_title || (!dll.starts_with("msvcp140") && !dll.starts_with("vcruntime140"))
+    };
     let dlls = load_title_dlls(main.info(), &dir, &cache, &wanted)?;
     let resolver = WithTitleDlls {
         inner: &Nothing,
         dlls: &dlls,
     };
+    // `MAC_LOAD_LIST=<file>`: every import left to provide, as `dll!symbol`.
+    let mut list = Vec::new();
     for (name, dll) in &dlls {
         let report = dll.bind_imports(&resolver, UnimplementedPolicy::ReturnZero)?;
+        list.extend(
+            report
+                .missing
+                .iter()
+                .map(|m| format!("{}!{}", m.dll, m.symbol)),
+        );
         println!(
             "bound          {name} at {:#x}: {} title, {} to provide",
             dll.base(),
@@ -57,6 +69,17 @@ fn main() -> Result<()> {
         );
     }
     let report = main.bind_imports(&resolver, UnimplementedPolicy::ReturnZero)?;
+    list.extend(
+        report
+            .missing
+            .iter()
+            .map(|m| format!("{}!{}", m.dll, m.symbol)),
+    );
+    if let Some(path) = std::env::var_os("MAC_LOAD_LIST") {
+        list.sort();
+        list.dedup();
+        std::fs::write(&path, list.join("\n") + "\n")?;
+    }
     println!(
         "bound          game_scarlett_master.exe: {} title, {} to provide",
         report.title,

@@ -72,6 +72,10 @@ Each step ends with a check that runs on the Mac.
    Check: `victory run` on macOS prints the same bind table as the Wine run.
    Done: `cargo run --target x86_64-apple-darwin -p victory-loader --example mac_load -- <title folder>` maps the title at 0x140000000 with TLS index 0, binds 72 imports between the title's images, leaves exactly the Wine run's runtime + host imports to provide (515, 198, 60, 57, 22), and a second copy moves all 598,281 relocations correctly.
 5. Host layer: the Windows functions in the "Host" column, on POSIX and Mach, plus structured exception handling from the images' unwind tables.
+   The title ships Microsoft's C++ runtime (`msvcp140.dll`, `vcruntime140*.dll`), so the loader maps it like the title's other DLLs instead of reimplementing it.
+   `MAC_LOAD_CXX=title MAC_LOAD_LIST=<file>` with the example above lists what is then left: 563 functions, of which 227 are the C runtime (`api-ms-win-crt-*`), 226 the kernel (`api-ms-win-core-*`, `kernel32`), 25 sockets, 16 WinHTTP, and about 40 Xbox ones our runtime already has.
+   The C++ runtime's exceptions need `RtlUnwindEx` and its kin, read from each image's `.pdata`.
+   Order: the runtime crate (`victory-hle`) builds on macOS with its Windows calls behind the host layer; then threads, memory, files and synchronisation; then exceptions; then the C runtime.
    Check: the title runs with `VICTORY_NO_DRAWS=1` and a null GPU, and its memory is measured.
 6. Metal back end over unified memory: title GPU memory is a few no-copy Metal buffers, so a GPU address is the CPU address plus that buffer's offset.
    Check: the first frame of the title draws.
