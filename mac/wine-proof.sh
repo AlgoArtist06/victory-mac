@@ -31,7 +31,9 @@ export VICTORY_GAME_DIR=$WGAME
 [ "$VICTORY_NO_DRAWS" = 0 ] && unset VICTORY_NO_DRAWS
 trap 'pkill -f "victory.exe run"; "$RT/bin/wineserver" -k 2>/dev/null' EXIT INT TERM
 "$RT/bin/wine" "$EXE" run "$@" "$WGAME\\game_scarlett_master.exe" > "$OUT/log.txt" 2>&1 &
-sleep 3
+# Wine may take a while to start the engine; wait for it, at most 30 s.
+w=0
+while [ -z "$(running)" ] && [ $w -lt 30 ]; do sleep 1; w=$((w + 1)); done
 echo "seconds rss_mb footprint swap_used free_pct cpu_pct" > "$OUT/mem.tsv"
 t=0
 while [ $t -lt "$SECS" ]; do

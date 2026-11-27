@@ -53,6 +53,18 @@ The process's physical footprint grew from 357 MB to 2.1 GB in the first minute,
 Swap stayed at about 1 GB.
 This includes the memory the title allocates for its GPU resources, but not our pipelines, render targets or host GPU copies.
 
+With drawing on, the picture was black because the engine's two-plane composer failed every frame.
+On Series S the title draws its interface on a second plane, and the engine composes both planes into one image.
+The composer took its root signature from its compiled HLSL, but Wine's HLSL compiler ignores the `[RootSignature]` attribute, so creating it failed with 0x80004005 and the interface plane was dropped.
+`mac/d3d12-probe.cpp` shows this under D3DMetal, and shows that a root signature built from a description works.
+The composer now builds its root signature that way.
+About 15 other helper shaders in `victory-gpu` still take their root signature from HLSL, so they fail the same way under Wine.
+
+The title then showed its "press A" screen (19 draws a frame), waiting for a player.
+With `VICTORY_KEYS` pressing Enter (A) on a timer, it went through its intro art, first-run settings, brightness and legal screens, to a loading screen.
+In the legal notices, many letters of the body text are missing; the headings are complete.
+At the end of the 280 s run, it was still loading, at a footprint of 5.8 GB and 3 GB of swap.
+
 Two problems are Wine's, not the title's:
 `GetLogicalDrives` never returns inside this process under this Wine build,
 and Wine imitates write watch with read-only pages, so a fault inside an AVX2 masked store stops the process with a Rosetta error.

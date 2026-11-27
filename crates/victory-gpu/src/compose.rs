@@ -14,19 +14,16 @@ use windows::core::{PCSTR, s};
 use crate::host::Host;
 
 const SOURCE: &str = r#"
-#define RS "DescriptorTable(SRV(t0, numDescriptors=2), visibility=SHADER_VISIBILITY_PIXEL), StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_LINEAR, addressU=TEXTURE_ADDRESS_CLAMP, addressV=TEXTURE_ADDRESS_CLAMP)"
 Texture2D<float4> scene : register(t0);
 Texture2D<float4> over : register(t1);
 SamplerState smooth_ : register(s0);
 struct V { float4 at : SV_Position; float2 uv : TEXCOORD0; };
-[RootSignature(RS)]
 V vs(uint id : SV_VertexID) {
     V v;
     v.uv = float2((id << 1) & 2, id & 2);
     v.at = float4(v.uv * float2(2, -2) + float2(-1, 1), 0, 1);
     return v;
 }
-[RootSignature(RS)]
 float4 ps(V v) : SV_Target {
     float4 s = scene.SampleLevel(smooth_, v.uv, 0);
     float4 o = over.SampleLevel(smooth_, v.uv, 0);
@@ -76,6 +73,53 @@ fn compile(entry: PCSTR, target: PCSTR) -> windows::core::Result<ID3DBlob> {
     code.ok_or_else(windows::core::Error::empty)
 }
 
+/// Two shader views for the pixel shader and a linear clamping sampler.
+/// Built here, not taken from the shader: Wine's HLSL compiler ignores the
+/// `[RootSignature]` attribute, so its shaders hold none.
+fn root_signature(device: &ID3D12Device) -> windows::core::Result<ID3D12RootSignature> {
+    let range = D3D12_DESCRIPTOR_RANGE {
+        RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+        NumDescriptors: 2,
+        ..Default::default()
+    };
+    let param = D3D12_ROOT_PARAMETER {
+        ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+        Anonymous: D3D12_ROOT_PARAMETER_0 {
+            DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
+                NumDescriptorRanges: 1,
+                pDescriptorRanges: &range,
+            },
+        },
+        ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+    };
+    let sampler = D3D12_STATIC_SAMPLER_DESC {
+        Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+        AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        MaxLOD: D3D12_FLOAT32_MAX,
+        ..Default::default()
+    };
+    let desc = D3D12_ROOT_SIGNATURE_DESC {
+        NumParameters: 1,
+        pParameters: &param,
+        NumStaticSamplers: 1,
+        pStaticSamplers: &sampler,
+        Flags: D3D12_ROOT_SIGNATURE_FLAG_NONE,
+    };
+    // SAFETY: the description points at locals alive through the calls; the
+    // blob is read before it is released.
+    unsafe {
+        let mut blob: Option<ID3DBlob> = None;
+        D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &mut blob, None)?;
+        let blob = blob.ok_or_else(windows::core::Error::empty)?;
+        device.CreateRootSignature(
+            0,
+            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize()),
+        )
+    }
+}
+
 impl Composer {
     pub(crate) fn new(host: &Host, format: DXGI_FORMAT) -> windows::core::Result<Self> {
         let (vs, ps) = (
@@ -84,11 +128,8 @@ impl Composer {
         );
         // SAFETY: the blobs' own bytes, alive through the calls.
         unsafe {
-            let bytes = |b: &ID3DBlob| {
-                std::slice::from_raw_parts(b.GetBufferPointer().cast::<u8>(), b.GetBufferSize())
-            };
             let device = &host.device;
-            let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes(&vs))?;
+            let root = root_signature(device)?;
             let code = |b: &ID3DBlob| D3D12_SHADER_BYTECODE {
                 pShaderBytecode: b.GetBufferPointer(),
                 BytecodeLength: b.GetBufferSize(),
