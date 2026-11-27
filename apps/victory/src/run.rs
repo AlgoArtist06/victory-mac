@@ -284,9 +284,24 @@ pub fn run(
         victory_loader::enter_every_thread();
         // SAFETY: imports are bound; from here on we run title code.
         let main = unsafe { Arc::new(image).spawn_main(dlls)? };
-        let code = main
-            .join()
-            .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
+        let wait = move || -> Result<u32> {
+            main.join()
+                .map_err(|_| anyhow::anyhow!("title main thread panicked"))?
+        };
+        if victory_metal::wanted() {
+            // AppKit wants the main thread: the title's end is waited for
+            // on another, which ends the process.
+            std::thread::spawn(move || {
+                let code = wait().unwrap_or_else(|e| {
+                    eprintln!("{e:#}");
+                    1
+                });
+                println!("title exited with {code}");
+                std::process::exit(code as i32)
+            });
+            victory_metal::run_app()
+        }
+        let code = wait()?;
         println!("title exited with {code}");
         Ok(())
     }
