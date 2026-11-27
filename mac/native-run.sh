@@ -15,6 +15,7 @@ if [ -n "$(running)" ]; then
   exit 1
 fi
 mkdir -p "$OUT" && cd "$OUT"
+echo "seconds footprint swap_used memory_level" > "$OUT/mem.tsv"
 export ROSETTA_ADVERTISE_AVX=1
 "$EXE" run --execute "$@" "$GAME/game_scarlett_master.exe" > "$OUT/log.txt" 2>&1 &
 PID=$!
@@ -29,6 +30,10 @@ while kill -0 $PID 2>/dev/null && [ $t -lt "$SECS" ]; do
   if [ "$(echo "${S%M} > 2500" | bc)" = 1 ] || [ "$low" -ge 2 ]; then
     echo "stopped after ${t}s: memory too low (swap $S, level $L%)" >> "$OUT/log.txt"
     break
+  fi
+  if [ $((t % 5)) -eq 0 ]; then
+    F=$(footprint -p "$PID" 2>/dev/null | awk '/phys_footprint:/ {print $2 $3; exit}')
+    echo "$t $F $S $L%" >> "$OUT/mem.tsv"
   fi
   sleep 1; t=$((t + 1))
 done
