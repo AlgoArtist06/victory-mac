@@ -13,7 +13,13 @@
 mod mac;
 
 #[cfg(target_os = "macos")]
-pub use mac::{present, run_app};
+pub use mac::{keys_held, present, run_app};
+
+/// No window, no keys.
+#[cfg(not(target_os = "macos"))]
+pub fn keys_held() -> Vec<u8> {
+    Vec::new()
+}
 
 /// Whether the title gets a window (`VICTORY_WINDOW=0`: none, for runs
 /// without a display).

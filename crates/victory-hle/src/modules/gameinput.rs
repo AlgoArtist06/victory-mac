@@ -604,6 +604,11 @@ fn scan_code(vk: u8) -> u32 {
         0x1B => 0x01,
         0x09 => 0x0F,
         0x08 => 0x0E,
+        0x20 => 0x39,
+        0xA0 => 0x2A,
+        0xA1 => 0x36,
+        0xA2 => 0x1D,
+        0xA4 => 0x38,
         0x26 => 0xE048,
         0x28 => 0xE050,
         0x25 => 0xE04B,
@@ -626,9 +631,14 @@ fn host() -> Box<dyn Source> {
         }
         fn keys(&mut self) -> Vec<KeyState> {
             #[cfg(feature = "diagnostics")]
-            let down = scripted();
+            let mut down = scripted();
             #[cfg(not(feature = "diagnostics"))]
-            let down: Vec<u8> = Vec::new();
+            let mut down: Vec<u8> = Vec::new();
+            for vk in victory_metal::keys_held() {
+                if !down.contains(&vk) {
+                    down.push(vk);
+                }
+            }
             down.into_iter()
                 .map(|vk| KeyState {
                     scan_code: scan_code(vk),

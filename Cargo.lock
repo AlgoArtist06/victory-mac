@@ -894,6 +894,7 @@ dependencies = [
  "victory-formats",
  "victory-gpu",
  "victory-loader",
+ "victory-metal",
  "victory-pe",
  "windows",
  "windows-core",
@@ -920,6 +921,7 @@ dependencies = [
 name = "victory-metal"
 version = "0.1.0"
 dependencies = [
+ "block2",
  "objc2",
  "objc2-app-kit",
  "objc2-core-foundation",
