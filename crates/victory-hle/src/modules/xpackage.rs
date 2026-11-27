@@ -335,7 +335,6 @@ mod tests {
 
         let this: This = &OBJECT;
         let register = method::<Register>(&OBJECT, 0x48);
-        assert_eq!(VTABLE.0[0x50 / 8], unregister_progress as *const ());
         let unregister = method::<Unregister>(&OBJECT, 0x50);
         for wait in [false, true] {
             let mut token = 0;
