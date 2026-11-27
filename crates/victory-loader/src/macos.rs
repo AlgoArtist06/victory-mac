@@ -455,6 +455,8 @@ pub fn enter_thread() {
 /// Sets up every thread that starts from now on for title code, as Windows
 /// gives every thread its thread block and TLS: our runtime's threads call
 /// the title back too (audio, storage, asynchronous work).
+/// ponytail: those threads are not announced to the title's images
+/// (`DLL_THREAD_ATTACH`); the title's own threads are.
 pub fn enter_every_thread() {
     type Hook = extern "C" fn(u32, libc::pthread_t, *mut std::ffi::c_void, usize);
     unsafe extern "C" {
@@ -464,9 +466,12 @@ pub fn enter_every_thread() {
     extern "C" fn on_thread(event: u32, thread: libc::pthread_t, at: *mut std::ffi::c_void, size: usize) {
         const START: u32 = 2;
         if event == START {
-            // SAFETY: a new thread, before its own code: as Windows' loader
-            // tells the images of each thread.
-            unsafe { enter_title_thread() };
+            // Only the blocks: this runs before Rust's own set-up of a
+            // thread it spawns, so no title code (which logs, and logging
+            // asks Rust for the current thread) may run here. Threads the
+            // title makes tell its images in their own body
+            // (`enter_title_thread`).
+            enter_thread();
         }
         if let Some(Some(previous)) = PREVIOUS.get() {
             previous(event, thread, at, size);

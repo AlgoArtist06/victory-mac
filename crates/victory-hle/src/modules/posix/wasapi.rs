@@ -302,6 +302,11 @@ extern "win64" fn property_value(_: *mut c_void, _key: *const c_void, out: *mut 
 /// still to play, and the clock's count of frames played.
 #[derive(Default)]
 struct Client {
+    /// The spatial stream's objects: type and buffer (a period's mono floats).
+    objects: Mutex<Vec<(u32, Arc<Mutex<Box<[u8]>>>)>>,
+    /// The format the title renders in: channels and bits (float if 32).
+    channels: AtomicU32,
+    bits: AtomicU32,
     ring: Mutex<Vec<u8>>,
     frames: AtomicU32,
     padding: AtomicU32,
@@ -352,6 +357,8 @@ extern "win64" fn initialize(this: *mut c_void, mode: u32, flags: u32, duration:
         let f = unsafe { format.read_unaligned() };
         let (tag, channels, rate, bits) = (f.tag, f.channels, f.rate, f.bits);
         tracing::debug!(mode, tag, channels, rate, bits, duration, period, "WASAPI: Initialize");
+        client(this).channels.store(u32::from(channels), Relaxed);
+        client(this).bits.store(u32::from(bits), Relaxed);
     }
     let frames = ((duration.max(2 * PERIOD) * i64::from(RATE)) / 10_000_000) as u32;
     let c = client(this);
@@ -490,8 +497,25 @@ extern "win64" fn get_buffer(this: *mut c_void, frames: u32, out: *mut *mut u8) 
     put(out, ring.as_mut_ptr())
 }
 
-extern "win64" fn release_buffer(this: *mut c_void, frames: u32, _flags: u32) -> Hresult {
-    client(this).padding.fetch_add(frames, AcqRel);
+/// What the title wrote goes to the speakers (float formats; the first two
+/// channels), unless it said it was silence.
+extern "win64" fn release_buffer(this: *mut c_void, frames: u32, flags: u32) -> Hresult {
+    const SILENT: u32 = 2;
+    let c = client(this);
+    let channels = c.channels.load(Relaxed).max(1) as usize;
+    if flags & SILENT == 0 && c.bits.load(Relaxed) == 32 {
+        let ring = c.ring.lock().unwrap_or_else(|e| e.into_inner());
+        let samples: Vec<f32> = ring
+            .chunks_exact(4 * channels)
+            .take(frames as usize)
+            .flat_map(|frame| {
+                let at = |i: usize| f32::from_le_bytes(frame[4 * i..4 * i + 4].try_into().expect("4 bytes"));
+                [at(0), at(1.min(channels - 1))]
+            })
+            .collect();
+        super::sound::play(&samples);
+    }
+    c.padding.fetch_add(frames, AcqRel);
     S_OK
 }
 
@@ -696,16 +720,38 @@ extern "win64" fn begin_update(_: *mut c_void, dynamic: *mut u32, frames: *mut u
     put(frames, PERIOD_FRAMES)
 }
 
-extern "win64" fn end_update(_: *mut c_void) -> Hresult {
+/// The pass is over: the objects' periods, mixed to stereo, go to the
+/// speakers, and the buffers are cleared for the next.
+extern "win64" fn end_update(this: *mut c_void) -> Hresult {
+    const FRONT_LEFT: u32 = 0x2;
+    const FRONT_RIGHT: u32 = 0x4;
+    let objects = client(this).objects.lock().unwrap_or_else(|e| e.into_inner());
+    let mut mix = vec![0.0f32; PERIOD_FRAMES as usize * 2];
+    for (kind, buffer) in objects.iter() {
+        let mut buffer = buffer.lock().unwrap_or_else(|e| e.into_inner());
+        let (left, right) = match *kind {
+            FRONT_LEFT => (1.0, 0.0),
+            FRONT_RIGHT => (0.0, 1.0),
+            _ => (0.5, 0.5),
+        };
+        for (i, sample) in buffer.chunks_exact(4).enumerate() {
+            let v = f32::from_le_bytes(sample.try_into().expect("4 bytes"));
+            mix[2 * i] += v * left;
+            mix[2 * i + 1] += v * right;
+        }
+        buffer.fill(0);
+    }
+    super::sound::play(&mix);
     S_OK
 }
 
-extern "win64" fn activate_object(_: *mut c_void, kind: u32, out: *mut *mut c_void) -> Hresult {
-    let buffer = vec![0u8; (PERIOD_FRAMES * 4) as usize].into_boxed_slice();
-    put(out, make(&SPATIAL_OBJECT, (kind, Mutex::new(buffer))))
+extern "win64" fn activate_object(this: *mut c_void, kind: u32, out: *mut *mut c_void) -> Hresult {
+    let buffer = Arc::new(Mutex::new(vec![0u8; (PERIOD_FRAMES * 4) as usize].into_boxed_slice()));
+    client(this).objects.lock().unwrap_or_else(|e| e.into_inner()).push((kind, buffer.clone()));
+    put(out, make(&SPATIAL_OBJECT, (kind, buffer)))
 }
 
-type ObjectState = (u32, Mutex<Box<[u8]>>);
+type ObjectState = (u32, Arc<Mutex<Box<[u8]>>>);
 
 static SPATIAL_OBJECT: Table = Table(&[
     object_query as *const (),

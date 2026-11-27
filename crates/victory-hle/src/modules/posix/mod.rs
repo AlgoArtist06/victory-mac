@@ -18,6 +18,7 @@ mod scanf;
 mod seh;
 pub use seh::install_signal_handlers;
 mod stdio;
+mod sound;
 mod system;
 mod wasapi;
 mod string;
