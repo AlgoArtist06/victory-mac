@@ -504,6 +504,16 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
             return r;
         }
     }
+    // A first-hit probe (diagnostics): the title goes on at its instruction.
+    // SAFETY: the system passes valid exception pointers.
+    unsafe {
+        const BREAKPOINT: i32 = 0x8000_0003_u32 as i32;
+        let record = &*(*info).ExceptionRecord;
+        if record.ExceptionCode == BREAKPOINT && crate::probe_hit(record.ExceptionAddress as usize) {
+            (*(*info).ContextRecord).Rip = record.ExceptionAddress as u64;
+            return -1; // EXCEPTION_CONTINUE_EXECUTION
+        }
+    }
     // SAFETY: the system passes valid exception pointers.
     if unsafe { emulate_amd_only(info) } {
         return -1; // EXCEPTION_CONTINUE_EXECUTION

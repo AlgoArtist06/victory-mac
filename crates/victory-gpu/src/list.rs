@@ -830,7 +830,6 @@ const COPY_DEST: u32 = 0x400;
 const COPY_SOURCE: u32 = 0x800;
 
 /// `len` bytes at `offset` of a title buffer, if they are inside it.
-#[cfg(windows)]
 fn buffer_range(buffer: This, offset: u64, len: u64) -> Option<*mut u8> {
     let (data, size) = crate::resource::buffer_bytes(buffer)?;
     let end = offset.checked_add(len)?;
@@ -856,6 +855,37 @@ fn buffer_copy(this: This, list: &crate::host::HostList, to: *mut u8, from: *con
     }
 }
 
+/// Without a host GPU (macOS for now), what lists do that the CPU can see
+/// is done as the calls are recorded, as value writes are
+/// ([`defer_write`]): GPU addresses are title memory.
+#[cfg(not(windows))]
+mod null_gpu {
+    unsafe extern "C" {
+        static mach_task_self_: u32;
+        fn mach_vm_region(task: u32, address: *mut u64, size: *mut u64, flavor: i32, info: *mut i32, count: *mut u32, object: *mut u32) -> i32;
+    }
+
+    /// Whether `[at, at + len)` lies in one mapped region with `access`
+    /// (VM_PROT bits: 1 read, 2 write).
+    fn mapped(at: usize, len: usize, access: i32) -> bool {
+        let (mut address, mut size) = (at as u64, 0u64);
+        let mut info = [0i32; 16];
+        let mut count = 9u32;
+        let mut object = 0u32;
+        // SAFETY: a query into our buffers (VM_REGION_BASIC_INFO_64: protection first).
+        let found = unsafe { mach_vm_region(mach_task_self_, &mut address, &mut size, 9, info.as_mut_ptr(), &mut count, &mut object) } == 0;
+        found && address as usize <= at && (address + size) as usize >= at + len && info[0] & access == access
+    }
+
+    /// A copy of title memory, if both sides are mapped.
+    pub(super) fn copy(to: usize, from: usize, len: usize) {
+        if len > 0 && mapped(from, len, 1) && mapped(to, len, 3) {
+            // SAFETY: both ranges are mapped with the access the copy needs.
+            unsafe { std::ptr::copy(from as *const u8, to as *mut u8, len) };
+        }
+    }
+}
+
 /// Buffer to buffer: both are host memory, copied at submission.
 extern "win64" fn copy_buffer_region(
     this: This,
@@ -873,7 +903,10 @@ extern "win64" fn copy_buffer_region(
         buffer_copy(this, list, to, from, len as usize);
     }
     #[cfg(not(windows))]
-    let _ = (this, dst, dst_offset, src, src_offset, len);
+    if let (Some(to), Some(from)) = (buffer_range(dst, dst_offset, len), buffer_range(src, src_offset, len)) {
+        let _ = this;
+        null_gpu::copy(to as usize, from as usize, len as usize);
+    }
 }
 
 /// Whether one of two resources is a target in a stand-in format and the
@@ -958,7 +991,10 @@ extern "win64" fn copy_resource(this: This, dst: This, src: This) {
         }
     }
     #[cfg(not(windows))]
-    let _ = (this, dst, src);
+    if let (Some((to, a)), Some((from, b))) = (crate::resource::buffer_bytes(dst), crate::resource::buffer_bytes(src)) {
+        let _ = this;
+        null_gpu::copy(to as usize, from as usize, a.min(b) as usize);
+    }
 }
 
 extern "win64" fn copy_resource_x(this: This, dst: This, src: This, _flags: u32) {
@@ -1455,7 +1491,12 @@ extern "win64" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: 
         });
     }
     #[cfg(not(windows))]
-    let _ = (this, dst, src, len);
+    {
+        let _ = this;
+        if dst != 0 && src != 0 {
+            null_gpu::copy(dst as usize, src as usize, len as usize);
+        }
+    }
 }
 
 /// `DriverHintX(feature, value)`: no hints for the host.

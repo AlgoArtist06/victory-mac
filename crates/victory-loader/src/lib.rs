@@ -63,6 +63,28 @@ pub use crash::{
 #[cfg(target_os = "macos")]
 pub use crash_macos::log_crash;
 
+static PROBE_BASE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Sets the first-hit probes `VICTORY_PROBE` names, offsets into the
+/// executable mapped at `base` (a diagnostic; see `console_insn`).
+#[cfg(any(windows, target_os = "macos"))]
+pub fn set_probes(base: usize) {
+    PROBE_BASE.store(base, std::sync::atomic::Ordering::Relaxed);
+    console_insn::set_probes(base);
+}
+
+/// Whether the `int3` at `at` was a probe's (now gone; the thread may go on
+/// at `at`).
+#[cfg(any(windows, target_os = "macos"))]
+pub fn probe_hit(at: usize) -> bool {
+    console_insn::probe_hit(at)
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn probe_base() -> usize {
+    PROBE_BASE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Emulates the console-only instruction a fault stopped at, if it is one,
 /// and steps over it: true then. `context` is the fault's Windows `CONTEXT`.
 ///

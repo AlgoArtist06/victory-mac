@@ -251,6 +251,7 @@ pub fn run(
     #[cfg(windows)]
     {
         victory_loader::report_crashes();
+        victory_loader::set_probes(image.base());
         victory_loader::set_before_thread_shutdown(victory_hle::known_pipelines::flush);
         victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
         victory_hle::runtime::use_console_timers();
@@ -278,6 +279,7 @@ pub fn run(
     }
     #[cfg(not(windows))]
     {
+        victory_loader::set_probes(image.base());
         victory_hle::modules::posix::install_signal_handlers();
         victory_loader::enter_every_thread();
         // SAFETY: imports are bound; from here on we run title code.

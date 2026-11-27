@@ -598,6 +598,63 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
     CONTINUE_EXECUTION
 }
 
+/// First-hit probes (`VICTORY_PROBE=<offset>[,<offset>..]`, hex offsets into
+/// the executable): each byte becomes `int3`; the first thread to reach it
+/// gets the byte back and the hit is logged. Set before the title runs.
+static PROBES: std::sync::OnceLock<Vec<(usize, u8)>> = std::sync::OnceLock::new();
+
+pub(crate) fn set_probes(base: usize) {
+    let probes = std::env::var("VICTORY_PROBE")
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|t| usize::from_str_radix(t.trim().trim_start_matches("0x"), 16).ok())
+        .filter_map(|offset| {
+            let at = base + offset;
+            // SAFETY: a byte of the title's code, not yet run.
+            unsafe {
+                let old = os::open_code(at, 1)?;
+                let was = (at as *const u8).read();
+                (at as *mut u8).write(0xcc);
+                os::close_code(at, 1, old);
+                Some((at, was))
+            }
+        })
+        .collect::<Vec<_>>();
+    if !probes.is_empty() {
+        tracing::info!(count = probes.len(), "probes set");
+    }
+    let _ = PROBES.set(probes);
+}
+
+/// A probe's `int3` at `at` (the instruction's own address): its byte back
+/// and the hit logged; true if it was one.
+pub(crate) fn probe_hit(at: usize) -> bool {
+    let Some(&(_, was)) = PROBES.get().and_then(|p| p.iter().find(|p| p.0 == at)) else {
+        return false;
+    };
+    let base = PROBES.get().map_or(0, |_| crate::probe_base());
+    // SAFETY: the probe's byte, in title code that stays mapped.
+    unsafe {
+        if let Some(old) = os::open_code(at, 1) {
+            (at as *mut u8).write(was);
+            os::close_code(at, 1, old);
+        }
+    }
+    let line = format!("VIctory probe hit: +{:#x}\n", at - base);
+    // A plain write: this runs inside an exception or signal handler.
+    #[cfg(not(windows))]
+    // SAFETY: a write to standard error.
+    unsafe {
+        libc::write(2, line.as_ptr().cast(), line.len());
+    }
+    #[cfg(windows)]
+    {
+        use std::io::Write;
+        let _ = std::io::stderr().write_all(line.as_bytes());
+    }
+    true
+}
+
 /// What the emulation asks of the system.
 #[cfg(windows)]
 mod os {

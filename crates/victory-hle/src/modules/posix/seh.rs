@@ -1132,55 +1132,7 @@ const INTEGER_DIVIDE_BY_ZERO: u32 = 0xC000_0094;
 /// Turns faults in title code into Windows exceptions, as Windows does:
 /// the title's own handlers see them, and an unhandled one is reported
 /// with the title's stack.
-/// First-hit probes (`VICTORY_PROBE=<offset>[,<offset>..]`, hex offsets into
-/// the executable): each byte is replaced by `int3`; the first time a
-/// thread reaches it, the byte comes back and the hit is logged.
-static PROBES: OnceLock<Vec<(usize, u8)>> = OnceLock::new();
-
-fn set_probes() {
-    let Some(base) = crate::runtime::main_image() else { return };
-    let wanted: Vec<usize> = std::env::var("VICTORY_PROBE")
-        .unwrap_or_default()
-        .split(',')
-        .filter_map(|t| usize::from_str_radix(t.trim().trim_start_matches("0x"), 16).ok())
-        .map(|offset| base + offset)
-        .collect();
-    let probes = wanted
-        .into_iter()
-        .filter_map(|at| {
-            let page = at & !4095;
-            // SAFETY: a byte of the title's code, made writable for the patch.
-            unsafe {
-                if libc::mprotect(page as *mut c_void, 4096, libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC) != 0 {
-                    return None;
-                }
-                let was = (at as *const u8).read();
-                (at as *mut u8).write(0xcc);
-                Some((at, was))
-            }
-        })
-        .collect::<Vec<_>>();
-    if !probes.is_empty() {
-        tracing::info!(count = probes.len(), "probes set");
-    }
-    let _ = PROBES.set(probes);
-}
-
-/// A probe's `int3` at `at`: its byte back, the hit noted. True if it was one.
-fn probe_hit(at: u64) -> bool {
-    let Some(&(_, was)) = PROBES.get().and_then(|p| p.iter().find(|p| p.0 as u64 == at)) else {
-        return false;
-    };
-    // SAFETY: the probe's byte, writable since `set_probes`.
-    unsafe { (at as *mut u8).write(was) };
-    let line = format!("VIctory probe hit: {} on thread {}\n", describe(at), super::current_thread_id());
-    // SAFETY: a plain write to standard error (safe in a signal handler).
-    unsafe { libc::write(2, line.as_ptr().cast(), line.len()) };
-    true
-}
-
 pub fn install_signal_handlers() {
-    set_probes();
     for signal in [libc::SIGSEGV, libc::SIGBUS, libc::SIGILL, libc::SIGTRAP, libc::SIGFPE] {
         // SAFETY: a handler of ours, with its information.
         unsafe {
@@ -1222,7 +1174,13 @@ extern "C" fn on_signal(signal: i32, info: *mut libc::siginfo_t, uc: *mut c_void
             if unsafe { *((rip - 1) as *const u8) } == 0xcc {
                 rip -= 1;
             }
-            if probe_hit(rip) {
+            if victory_loader::probe_hit(rip as usize) {
+                // At a function's start the caller's return address is on top.
+                // SAFETY: the thread's stack pointer.
+                let caller = unsafe { (mc.ss[7] as *const u64).read() };
+                let line = format!("  called from {} (rdx {:#x})\n", describe(caller), mc.ss[3]);
+                // SAFETY: a plain write to standard error.
+                unsafe { libc::write(2, line.as_ptr().cast(), line.len()) };
                 mc.ss[16] = rip;
                 return;
             }
