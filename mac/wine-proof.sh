@@ -1,7 +1,7 @@
 #!/bin/sh
 # Proof run under Wine (data only, not the target): runs the Windows build of
 # victory on the title with drawing off and logs memory every 5 seconds.
-# Usage: mac/wine-proof.sh <seconds, at most 300> [victory run arguments...]
+# Usage: mac/wine-proof.sh <seconds, at most 600> [victory run arguments...]
 # Needs: the Windows build (x86_64-pc-windows-gnullvm) with mac/wine-proof.patch
 # applied (Wine-only workarounds: GetLogicalDrives never returns in this
 # process under Wine 11, and Wine's write watch faults stop Rosetta inside
@@ -10,7 +10,7 @@
 set -u
 SECS=$1; shift
 # Every run lasts at most 5 minutes.
-[ "$SECS" -gt 300 ] && SECS=300
+[ "$SECS" -gt 600 ] && SECS=600
 OUT=${OUT:-/Volumes/victory-dev/proof}
 RT=${RT:-/Volumes/xo/dist/runtimes/d3dmetal-4.0b3}
 GAME=${GAME:-/Volumes/T7/alpha/GTA6.Xbox.v1.0.2.1/GTA6.Xbox.v1.0.2.1}
@@ -36,6 +36,7 @@ w=0
 while [ -z "$(running)" ] && [ $w -lt 30 ]; do sleep 1; w=$((w + 1)); done
 echo "seconds rss_mb footprint swap_used free_pct cpu_pct" > "$OUT/mem.tsv"
 t=0
+low=0
 while [ $t -lt "$SECS" ]; do
   P=$(running)
   [ -z "$P" ] && { echo "exited after ${t}s" >> "$OUT/mem.tsv"; break; }
@@ -44,6 +45,14 @@ while [ $t -lt "$SECS" ]; do
   S=$(sysctl -n vm.swapusage | awk '{print $6}')
   M=$(memory_pressure | awk '/free percentage/ {print $5}')
   echo "$t $(($1 / 1024)) $F $S $M $2" >> "$OUT/mem.tsv"
+  # An 8 GB Mac stopped answering and its watchdog restarted it at 3.5 GB
+  # of swap and 3% free (2026-11-27). Stop the title well before that.
+  L=$(sysctl -n kern.memorystatus_level)
+  if [ "$L" -lt 10 ]; then low=$((low + 1)); else low=0; fi
+  if [ "$(echo "${S%M} > 2500" | bc)" = 1 ] || [ "$low" -ge 2 ]; then
+    echo "stopped after ${t}s: memory too low (swap $S, level $L%)" >> "$OUT/mem.tsv"
+    break
+  fi
   sleep 5; t=$((t + 5))
 done
 sed 's/\x1b\[[0-9;]*m//g' "$OUT/log.txt" | grep -a -v -e '^[[:space:]]' -e mvk- -e msync -e FreeType -e freetype -e TrueType -e 'or equal' > "$OUT/clean.txt"

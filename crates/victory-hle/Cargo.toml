@@ -55,3 +55,6 @@ diagnostics = ["victory-gpu/diagnostics", "victory-loader/diagnostics", "dep:win
 
 [lints]
 workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc.workspace = true

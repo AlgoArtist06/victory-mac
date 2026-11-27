@@ -15,6 +15,14 @@ pub struct HostPolicy {
 }
 
 impl Default for HostPolicy {
+    /// On macOS no host DLLs exist: our modules provide everything, and the
+    /// C++ runtime comes from the title's folder.
+    #[cfg(not(windows))]
+    fn default() -> Self {
+        Self::none()
+    }
+
+    #[cfg(windows)]
     fn default() -> Self {
         let allow = [
             "api-ms-win-core-*",

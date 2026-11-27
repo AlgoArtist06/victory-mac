@@ -51,10 +51,6 @@ pub fn run(
     if execute {
         check_cpu_features()?;
     }
-    #[cfg(not(windows))]
-    if execute {
-        anyhow::bail!("executing titles on macOS needs the host layer (mac/README.md, step 5)");
-    }
     // A title that relaunched itself: the old process must be gone first.
     #[cfg(windows)]
     victory_hle::modules::lifecycle::wait_for_previous();
@@ -89,8 +85,17 @@ pub fn run(
     } else {
         HostPolicy::default()
     });
-    let wanted = |dll: &str| title_dll(&resolver.host, dll);
     let title_dir = exe.parent().unwrap_or(Path::new("."));
+    #[cfg(windows)]
+    let wanted = |dll: &str| title_dll(&resolver.host, dll);
+    // No system DLLs exist on macOS to take one from: the title's are the
+    // ones in its folder, and every other import is ours or missing.
+    #[cfg(not(windows))]
+    let in_folder: std::collections::HashSet<String> = std::fs::read_dir(title_dir)?
+        .filter_map(|e| Some(e.ok()?.file_name().to_str()?.to_ascii_lowercase()))
+        .collect();
+    #[cfg(not(windows))]
+    let wanted = |dll: &str| in_folder.contains(&dll.to_ascii_lowercase());
     // A missing manifest leaves id 0 and no storage quota.
     let manifest =
         std::fs::read_to_string(title_dir.join("MicrosoftGame.config")).unwrap_or_default();
@@ -108,6 +113,11 @@ pub fn run(
     {
         victory_hle::modules::files::mount_at('G', title_dir);
         victory_hle::modules::files::mount_at('T', &temp);
+    }
+    #[cfg(not(windows))]
+    {
+        victory_hle::modules::posix::paths::mount_at('G', title_dir);
+        victory_hle::modules::posix::paths::mount_at('T', &temp);
     }
     victory_hle::runtime::set_title(victory_hle::runtime::Title { storage, ..title });
     victory_hle::console::set(match console {
@@ -267,7 +277,15 @@ pub fn run(
         Ok(())
     }
     #[cfg(not(windows))]
-    unreachable!("macOS stops before executing (checked above)")
+    {
+        // SAFETY: imports are bound; from here on we run title code.
+        let main = unsafe { Arc::new(image).spawn_main(dlls)? };
+        let code = main
+            .join()
+            .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
+        println!("title exited with {code}");
+        Ok(())
+    }
 }
 
 /// The debugging aids (README): scheduled stack dumps, watched values and
@@ -405,7 +423,7 @@ fn poke(base: usize, size: usize) {
 }
 
 /// DLLs the host or our runtime provide are never taken from the title.
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(windows)]
 fn title_dll(host: &victory_hle::HostPolicy, dll: &str) -> bool {
     !host.allows(dll) && !victory_hle::registry().iter().any(|m| m.serves(dll))
 }

@@ -291,8 +291,29 @@ fn protection(characteristics: u32) -> i32 {
     prot
 }
 
-/// Sets up the calling thread for title code: its static TLS blocks, each
-/// a copy of its image's template, in an array that `gs:[0x58]` points at.
+/// Thread block offsets title code reads through `gs:[0x30]` (`NtCurrentTeb`).
+mod teb {
+    pub const STACK_BASE: usize = 0x08;
+    pub const STACK_LIMIT: usize = 0x10;
+    pub const SELF: usize = 0x30;
+    pub const PROCESS_ID: usize = 0x40;
+    pub const THREAD_ID: usize = 0x48;
+    pub const TLS_ARRAY: usize = 0x58;
+    pub const PEB: usize = 0x60;
+    /// Large enough for every field Windows has.
+    pub const SIZE: usize = 0x2000;
+}
+
+/// The process block (`PEB`) every thread block points at. Zeroed: title
+/// code reads `BeingDebugged` from it, and finds no debugger.
+fn peb() -> usize {
+    static PEB: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *PEB.get_or_init(|| Box::leak(vec![0u8; 0x1000].into_boxed_slice()).as_mut_ptr() as usize)
+}
+
+/// Sets up the calling thread for title code: a thread block at `gs:[0x30]`,
+/// and its static TLS blocks, each a copy of its image's template, in an
+/// array at `gs:[0x58]` (also in the thread block).
 /// ponytail: the blocks are leaked; freeing them at thread end comes with
 /// the host layer's threads.
 pub fn enter_thread() {
@@ -309,9 +330,130 @@ pub fn enter_thread() {
             Box::leak(block).as_mut_ptr() as usize
         })
         .collect();
-    let array = Box::leak(array.into_boxed_slice()).as_ptr() as u64;
-    // SAFETY: pthread slot 11 (gs:0x58) is unused by libSystem.
-    unsafe { std::arch::asm!("mov gs:[0x58], {}", in(reg) array, options(nostack)) };
+    let array = Box::leak(array.into_boxed_slice()).as_ptr() as usize;
+    let block = Box::leak(vec![0u8; teb::SIZE].into_boxed_slice()).as_mut_ptr() as usize;
+    // SAFETY: plain queries about the calling thread.
+    let (stack_base, stack_size, tid) = unsafe {
+        let me = libc::pthread_self();
+        let mut tid = 0u64;
+        libc::pthread_threadid_np(me, &mut tid);
+        (
+            libc::pthread_get_stackaddr_np(me) as usize,
+            libc::pthread_get_stacksize_np(me),
+            tid,
+        )
+    };
+    let fields = [
+        (teb::STACK_BASE, stack_base),
+        (teb::STACK_LIMIT, stack_base - stack_size),
+        (teb::SELF, block),
+        (teb::PROCESS_ID, std::process::id() as usize),
+        (teb::THREAD_ID, thread_id(tid) as usize),
+        (teb::TLS_ARRAY, array),
+        (teb::PEB, peb()),
+    ];
+    for (offset, value) in fields {
+        // SAFETY: inside the block just allocated.
+        unsafe { ((block + offset) as *mut usize).write(value) };
+    }
+    // SAFETY: pthread slots 6 and 11 (gs:0x30, gs:0x58) are unused by libSystem.
+    unsafe {
+        std::arch::asm!(
+            "mov gs:[0x30], {teb}",
+            "mov gs:[0x58], {tls}",
+            teb = in(reg) block,
+            tls = in(reg) array,
+            options(nostack),
+        )
+    };
+}
+
+/// Images attached so far, in order: each hears of every thread that starts.
+static ATTACHED: Mutex<Vec<LoadedImage>> = Mutex::new(Vec::new());
+
+/// Sets up a new title thread ([`enter_thread`]) and tells every attached
+/// image of it (`DLL_THREAD_ATTACH`), as Windows does for `CreateThread`.
+///
+/// # Safety
+/// Runs title code.
+pub unsafe fn enter_title_thread() {
+    const THREAD_ATTACH: u32 = 2;
+    enter_thread();
+    let images = ATTACHED.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    for image in &images {
+        // SAFETY: forwarded from the caller.
+        unsafe { image.notify(THREAD_ATTACH) };
+    }
+}
+
+/// A Windows thread id (32 bits) for a macOS one. Windows ids are multiples
+/// of 4, never 0.
+pub fn thread_id(tid: u64) -> u32 {
+    ((tid as u32) << 2).max(4)
+}
+
+impl LoadedImage {
+    /// Runs the image's TLS callbacks with `reason`, then, if it is a DLL
+    /// with an entry point, its `DllMain`, whose result is returned.
+    ///
+    /// # Safety
+    /// Runs title code: imports must be bound, and the thread entered.
+    pub unsafe fn notify(&self, reason: u32) -> Option<i32> {
+        type Callback = unsafe extern "win64" fn(usize, u32, *mut c_void) -> i32;
+        let call = |rva: u32| {
+            // SAFETY: RVAs from the image's own headers; forwarded from the caller.
+            unsafe {
+                let f: Callback = std::mem::transmute(self.base + rva as usize);
+                f(self.base, reason, std::ptr::null_mut())
+            }
+        };
+        if let Some(tls) = &self.info.tls {
+            tls.callback_rvas.iter().for_each(|&rva| {
+                call(rva);
+            });
+        }
+        (self.info.is_dll() && self.info.entry_rva != 0).then(|| call(self.info.entry_rva))
+    }
+
+    /// Starts the title on a new thread with the image's stack size: each DLL
+    /// attached in order, then the executable's TLS callbacks and entry point.
+    ///
+    /// # Safety
+    /// Runs title code. Imports must be bound.
+    pub unsafe fn spawn_main(
+        self: std::sync::Arc<Self>,
+        dlls: Vec<(String, LoadedImage)>,
+    ) -> Result<std::thread::JoinHandle<Result<u32>>> {
+        const PROCESS_ATTACH: u32 = 1;
+        if self.info.entry_rva == 0 {
+            bail!("image has no entry point");
+        }
+        let stack = usize::try_from(self.info.stack_reserve)
+            .unwrap_or(usize::MAX)
+            .max(1 << 20);
+        Ok(std::thread::Builder::new()
+            .name("title-main".into())
+            .stack_size(stack)
+            .spawn(move || {
+                enter_thread();
+                for (name, dll) in &dlls {
+                    // SAFETY: forwarded from the caller.
+                    if unsafe { dll.notify(PROCESS_ATTACH) } == Some(0) {
+                        bail!("DllMain of {name} returned FALSE");
+                    }
+                    ATTACHED.lock().unwrap_or_else(|e| e.into_inner()).push(dll.clone());
+                }
+                // SAFETY: forwarded from the caller.
+                unsafe { self.notify(PROCESS_ATTACH) };
+                ATTACHED.lock().unwrap_or_else(|e| e.into_inner()).push((*self).clone());
+                type Entry = unsafe extern "win64" fn(usize) -> u32;
+                // SAFETY: the entry RVA came from the image header.
+                let entry: Entry =
+                    unsafe { std::mem::transmute(self.base + self.info.entry_rva as usize) };
+                // SAFETY: forwarded from the caller.
+                Ok(unsafe { entry(peb()) })
+            })?)
+    }
 }
 
 #[cfg(test)]

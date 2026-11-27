@@ -65,7 +65,7 @@ pub use crash_macos::log_crash;
 #[cfg(any(windows, target_os = "macos"))]
 pub use images::{BindReport, MissingImport, WithTitleDlls, load_title_dll, load_title_dlls};
 #[cfg(target_os = "macos")]
-pub use macos::{LoadedImage, enter_thread, load};
+pub use macos::{LoadedImage, enter_thread, enter_title_thread, load, thread_id};
 pub use prepare::{PrepareError, PreparedImage, prepare};
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use profile::profile_on_schedule;

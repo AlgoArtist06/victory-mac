@@ -26,6 +26,8 @@ pub mod lifecycle;
 pub mod media;
 #[cfg(windows)]
 pub mod net;
+#[cfg(target_os = "macos")]
+pub mod posix;
 pub mod rpcrt4;
 pub mod speech;
 pub mod storage;
@@ -72,5 +74,8 @@ pub(crate) fn all() -> Vec<HleModule> {
     all.push(xmem::module());
     #[cfg(windows)]
     all.push(xsystem::module());
+    // Last: what the host's DLLs give on Windows, under any of ours above.
+    #[cfg(target_os = "macos")]
+    all.extend(posix::modules());
     all
 }
