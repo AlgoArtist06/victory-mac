@@ -11,7 +11,10 @@ mod decode;
 use decode::ConsoleOnly;
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+#[cfg(windows)]
 use windows_sys::Win32::System::Diagnostics::Debug::CONTEXT;
+#[cfg(not(windows))]
+pub use os::CONTEXT;
 
 const CONTINUE_EXECUTION: i32 = -1;
 
@@ -113,32 +116,30 @@ fn clzero_stub(at: usize, stub: usize, cmp: [u8; 3]) -> Option<Vec<u8>> {
     Some(code)
 }
 
+/// The status flags `cmp a, b` leaves (CF, PF, AF, ZF, SF, OF) as `EFLAGS` bits.
+pub(crate) fn cmp_flags(a: u64, b: u64) -> u32 {
+    let r = a.wrapping_sub(b);
+    u32::from(a < b)
+        | u32::from((r as u8).count_ones().is_multiple_of(2)) << 2
+        | (((a ^ b ^ r) >> 4) as u32 & 1) << 4
+        | u32::from(r == 0) << 6
+        | ((r >> 63) as u32) << 7
+        | ((((a ^ b) & (a ^ r)) >> 63) as u32) << 11
+}
+pub(crate) const CMP_FLAGS: u32 = 0x8d5;
+
 /// Room for [`clzero_stub`]s near the title's code: where it is and the bytes used.
 static STUBS: std::sync::Mutex<Option<(usize, usize)>> = std::sync::Mutex::new(None);
 pub(crate) const STUBS_LEN: usize = 64 << 10;
 
 /// Memory for code within reach of a `jmp rel32` at `at`.
 pub(crate) fn near(at: usize) -> Option<usize> {
-    use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc,
-    };
     let at = at & !0xffff;
     (0x10_0000..0x7000_0000)
         .step_by(0x10_0000)
         .flat_map(|d| [at.checked_sub(d), at.checked_add(d)])
         .flatten()
-        .find_map(|place| {
-            // SAFETY: reserves free memory at that address or fails.
-            let got = unsafe {
-                VirtualAlloc(
-                    place as *const _,
-                    STUBS_LEN,
-                    MEM_COMMIT | MEM_RESERVE,
-                    PAGE_EXECUTE_READWRITE,
-                )
-            } as usize;
-            (got != 0).then_some(got)
-        })
+        .find_map(|place| os::code_at(place, STUBS_LEN))
 }
 
 /// Replaces the `clzero` loop at `at`, whose 12 bytes are `code`: whether it did.
@@ -199,22 +200,18 @@ static PATCHING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// `at` is in code that stays mapped, and `patch` does for it what `was` does.
 unsafe fn patch<const N: usize>(at: usize, was: [u8; N], patch: [u8; N]) -> bool {
     use std::sync::atomic::Ordering::SeqCst;
-    use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
-    use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
     if (at & 15) + N > 16 || !std::is_x86_feature_detected!("cmpxchg16b") {
         return false;
     }
     let _one = PATCHING.lock().unwrap_or_else(|e| e.into_inner());
     let word = (at & !15) as *mut u128;
     let here = (at & 15)..(at & 15) + N;
-    let mut old = 0u32;
     // SAFETY: the aligned 16 bytes around the instruction lie in one page of mapped code, made
     // writable for the store and put back; the processor has the instruction (asked above).
     unsafe {
-        if VirtualProtect(word.cast(), 16, PAGE_EXECUTE_READWRITE, &mut old) == 0 {
+        let Some(old) = os::open_code(word as usize, 16) else {
             return false;
-        }
+        };
         // What is there (zeros are replaced by zeros).
         let mut now = std::arch::x86_64::cmpxchg16b(word, 0, 0, SeqCst, SeqCst);
         let done = loop {
@@ -235,8 +232,7 @@ unsafe fn patch<const N: usize>(at: usize, was: [u8; N], patch: [u8; N]) -> bool
             }
             now = there;
         };
-        VirtualProtect(word.cast(), 16, old, &mut old);
-        FlushInstructionCache(GetCurrentProcess(), word.cast(), 16);
+        os::close_code(word as usize, 16, old);
         done
     }
 }
@@ -337,18 +333,8 @@ mod sites {
 }
 
 fn readable(va: usize, bytes: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
-    };
-    // SAFETY: plain data filled in by the query.
-    let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-    // SAFETY: a valid out pointer of the right size.
-    let found = unsafe { VirtualQuery(va as *const _, &mut m, size_of_val(&m)) } != 0;
     ASKED.fetch_add(1, Relaxed);
-    found
-        && m.State == MEM_COMMIT
-        && m.Protect & (PAGE_NOACCESS | PAGE_GUARD) == 0
-        && m.BaseAddress as usize + m.RegionSize >= va + bytes
+    os::region(va).is_some_and(|(_, end, read, _)| read && end >= va + bytes)
 }
 
 fn writable(va: usize, bytes: usize) -> bool {
@@ -362,9 +348,6 @@ fn writable(va: usize, bytes: usize) -> bool {
 /// on view memory opens as it does any write, and which is a crash otherwise (as the
 /// unchecked single-line emulation behind this one already is).
 fn writable_to(va: usize, end: usize) -> Option<usize> {
-    use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE, PAGE_READWRITE, VirtualQuery,
-    };
     let remember = remembers();
     if remember {
         let (regions, answers) = WRITABLE.with(Cell::get);
@@ -378,19 +361,11 @@ fn writable_to(va: usize, end: usize) -> Option<usize> {
             return Some(to.min(end));
         }
     }
-    // SAFETY: plain data filled in by the query.
-    let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-    // SAFETY: a valid out pointer of the right size.
-    let found = unsafe { VirtualQuery(va as *const _, &mut m, size_of_val(&m)) } != 0;
     ASKED.fetch_add(1, Relaxed);
-    if !found || m.State != MEM_COMMIT || m.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE) == 0
-    {
-        return None;
-    }
-    let (from, to) = (
-        m.BaseAddress as usize,
-        m.BaseAddress as usize + m.RegionSize,
-    );
+    let (from, to) = match os::region(va) {
+        Some((from, to, _, true)) => (from, to),
+        _ => return None,
+    };
     if remember {
         WRITABLE.with(|w| {
             let (mut regions, answers) = w.get();
@@ -455,14 +430,12 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
         ConsoleOnly::Ud2 => return 0,
         ConsoleOnly::Clwb => {
             // nothing to write back on the PC: patched to NOPs, no exception next time
-            use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
-            let mut old = 0u32;
             let _one = PATCHING.lock().unwrap_or_else(|e| e.into_inner());
             // SAFETY: the instruction's own bytes, made writable for the patch and restored.
             unsafe {
-                if VirtualProtect(rip as *const _, len, PAGE_EXECUTE_READWRITE, &mut old) != 0 {
+                if let Some(old) = os::open_code(rip, len) {
                     std::slice::from_raw_parts_mut(rip as *mut u8, len).fill(0x90);
-                    VirtualProtect(rip as *const _, len, old, &mut old);
+                    os::close_code(rip, len, old);
                 }
             }
         }
@@ -545,21 +518,17 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
                 // there (the same instruction again), where the real one faults too.
                 return CONTINUE_EXECUTION;
             }
-            ctx.EFlags = ctx.EFlags & !crate::crash::CMP_FLAGS
-                | crate::crash::cmp_flags(ctx.Rax, end as u64);
+            ctx.EFlags = ctx.EFlags & !CMP_FLAGS
+                | cmp_flags(ctx.Rax, end as u64);
         }
         ConsoleOnly::Rdpru => {
-            let mut v = 0i64;
-            // SAFETY: a valid out pointer.
-            unsafe { windows_sys::Win32::System::Performance::QueryPerformanceCounter(&mut v) };
-            let v = if ctx.Rcx as u32 <= 1 { v as u64 } else { 0 };
+            let v = os::counter();
+            let v = if ctx.Rcx as u32 <= 1 { v } else { 0 };
             ctx.Rax = v & 0xFFFF_FFFF;
             ctx.Rdx = v >> 32;
         }
         ConsoleOnly::Rdpid(r) => {
-            // SAFETY: no preconditions.
-            let cpu = unsafe { windows_sys::Win32::System::Threading::GetCurrentProcessorNumber() }
-                as u64;
+            let cpu = os::processor();
             let regs: [&mut u64; 16] = [
                 &mut ctx.Rax,
                 &mut ctx.Rcx,
@@ -629,7 +598,197 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
     CONTINUE_EXECUTION
 }
 
-#[cfg(test)]
+/// What the emulation asks of the system.
+#[cfg(windows)]
+mod os {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE, PAGE_GUARD,
+        PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc, VirtualProtect, VirtualQuery,
+    };
+
+    /// `len` bytes of code memory at exactly `at`, if free.
+    pub(super) fn code_at(at: usize, len: usize) -> Option<usize> {
+        // SAFETY: reserves free memory at that address or fails.
+        let got = unsafe {
+            VirtualAlloc(at as *const _, len, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE)
+        } as usize;
+        (got != 0).then_some(got)
+    }
+
+    /// Makes code writable; its old protection.
+    ///
+    /// # Safety
+    /// `at..at + len` is mapped code.
+    pub(super) unsafe fn open_code(at: usize, len: usize) -> Option<u32> {
+        let mut old = 0u32;
+        // SAFETY: guaranteed by the caller.
+        (unsafe { VirtualProtect(at as *const _, len, PAGE_EXECUTE_READWRITE, &mut old) } != 0)
+            .then_some(old)
+    }
+
+    /// # Safety
+    /// As [`open_code`], with its answer.
+    pub(super) unsafe fn close_code(at: usize, len: usize, old: u32) {
+        use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let mut was = 0u32;
+        // SAFETY: guaranteed by the caller.
+        unsafe {
+            VirtualProtect(at as *const _, len, old, &mut was);
+            FlushInstructionCache(GetCurrentProcess(), at as *const _, len);
+        }
+    }
+
+    /// The committed region `va` is in: start, end, readable, writable.
+    pub(super) fn region(va: usize) -> Option<(usize, usize, bool, bool)> {
+        // SAFETY: plain data filled in by the query.
+        let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let found = unsafe { VirtualQuery(va as *const _, &mut m, size_of_val(&m)) } != 0;
+        if !found || m.State != MEM_COMMIT {
+            return None;
+        }
+        let from = m.BaseAddress as usize;
+        Some((
+            from,
+            from + m.RegionSize,
+            m.Protect & (PAGE_NOACCESS | PAGE_GUARD) == 0,
+            m.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE) != 0,
+        ))
+    }
+
+    pub(super) fn counter() -> u64 {
+        let mut v = 0i64;
+        // SAFETY: a valid out pointer.
+        unsafe { windows_sys::Win32::System::Performance::QueryPerformanceCounter(&mut v) };
+        v as u64
+    }
+
+    pub(super) fn processor() -> u64 {
+        // SAFETY: no preconditions.
+        u64::from(unsafe { windows_sys::Win32::System::Threading::GetCurrentProcessorNumber() })
+    }
+}
+
+#[cfg(not(windows))]
+mod os {
+    /// The Windows `CONTEXT` the fault dispatcher hands over (same layout,
+    /// the fields the emulation uses named as in `windows_sys`).
+    #[allow(non_snake_case)]
+    #[repr(C, align(16))]
+    pub struct CONTEXT {
+        _home: [u64; 6],
+        pub ContextFlags: u32,
+        pub MxCsr: u32,
+        _segments: [u16; 6],
+        pub EFlags: u32,
+        _debug: [u64; 6],
+        pub Rax: u64,
+        pub Rcx: u64,
+        pub Rdx: u64,
+        pub Rbx: u64,
+        pub Rsp: u64,
+        pub Rbp: u64,
+        pub Rsi: u64,
+        pub Rdi: u64,
+        pub R8: u64,
+        pub R9: u64,
+        pub R10: u64,
+        pub R11: u64,
+        pub R12: u64,
+        pub R13: u64,
+        pub R14: u64,
+        pub R15: u64,
+        pub Rip: u64,
+        pub Anonymous: FloatArea,
+        _rest: [u8; 0x4d0 - 0x300],
+    }
+    const _: () = assert!(size_of::<CONTEXT>() == 0x4d0);
+
+    #[allow(non_snake_case)]
+    #[repr(C)]
+    pub struct FloatArea {
+        pub FltSave: FloatSave,
+    }
+
+    #[allow(non_snake_case)]
+    #[repr(C)]
+    pub struct FloatSave {
+        _header: [u8; 0xa0],
+        pub XmmRegisters: [M128A; 16],
+        _reserved: [u8; 96],
+    }
+
+    #[allow(non_snake_case)]
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct M128A {
+        pub Low: u64,
+        pub High: i64,
+    }
+
+    unsafe extern "C" {
+        static mach_task_self_: u32;
+        fn mach_vm_allocate(task: u32, address: *mut u64, size: u64, flags: i32) -> i32;
+        fn mach_vm_region(task: u32, address: *mut u64, size: *mut u64, flavor: i32, info: *mut i32, count: *mut u32, object: *mut u32) -> i32;
+        fn clock_gettime_nsec_np(clock: libc::clockid_t) -> u64;
+    }
+
+    const RWX: i32 = libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC;
+
+    pub(super) fn code_at(at: usize, len: usize) -> Option<usize> {
+        let mut address = at as u64;
+        // SAFETY: a fixed allocation that fails rather than replace.
+        unsafe {
+            (mach_vm_allocate(mach_task_self_, &mut address, len as u64, 0) == 0
+                && libc::mprotect(at as *mut _, len, RWX) == 0)
+                .then_some(at)
+        }
+    }
+
+    /// Makes code writable (its pages); title code is read and execute.
+    ///
+    /// # Safety
+    /// `at..at + len` is mapped code.
+    pub(super) unsafe fn open_code(at: usize, len: usize) -> Option<i32> {
+        let page = at & !4095;
+        let span = (at + len).next_multiple_of(4096) - page;
+        // SAFETY: guaranteed by the caller.
+        (unsafe { libc::mprotect(page as *mut _, span, RWX) } == 0).then_some(libc::PROT_READ | libc::PROT_EXEC)
+    }
+
+    /// # Safety
+    /// As [`open_code`], with its answer.
+    pub(super) unsafe fn close_code(at: usize, len: usize, old: i32) {
+        let page = at & !4095;
+        let span = (at + len).next_multiple_of(4096) - page;
+        // SAFETY: guaranteed by the caller.
+        unsafe { libc::mprotect(page as *mut _, span, old) };
+    }
+
+    pub(super) fn region(va: usize) -> Option<(usize, usize, bool, bool)> {
+        let (mut address, mut size) = (va as u64, 0u64);
+        let mut info = [0i32; 16];
+        let mut count = 9u32;
+        let mut object = 0u32;
+        // SAFETY: a query into our buffers (VM_REGION_BASIC_INFO_64: protection first).
+        let found = unsafe { mach_vm_region(mach_task_self_, &mut address, &mut size, 9, info.as_mut_ptr(), &mut count, &mut object) } == 0;
+        (found && address as usize <= va)
+            .then(|| (address as usize, (address + size) as usize, info[0] & 1 != 0, info[0] & 2 != 0))
+    }
+
+    /// 100 ns ticks, as Windows' counter.
+    pub(super) fn counter() -> u64 {
+        // SAFETY: a plain query.
+        unsafe { clock_gettime_nsec_np(libc::CLOCK_MONOTONIC_RAW) / 100 }
+    }
+
+    pub(super) fn processor() -> u64 {
+        0
+    }
+}
+
+#[cfg(all(test, windows))]
 mod tests {
     use super::*;
 

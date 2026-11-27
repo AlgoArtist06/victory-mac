@@ -24,7 +24,11 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::{CStr, c_char, c_void};
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
+#[cfg(windows)]
 use std::os::windows::fs::FileExt;
+#[cfg(windows)]
 use std::os::windows::io::FromRawHandle;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
@@ -117,14 +121,12 @@ fn from_win32(error: &std::io::Error) -> HRESULT {
 
 type Factory = *const Object;
 
-/// Opens `path` for reading; the file object owns the handle.
-extern "win64" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out: Out) -> HRESULT {
+/// The title's file at `path` (`name`), opened for reading.
+#[cfg(windows)]
+fn open_path(path: *const u16, name: &str) -> Option<std::fs::File> {
     const GENERIC_READ: u32 = 0x8000_0000;
     const FILE_SHARE_READ: u32 = 1;
     const OPEN_EXISTING: u32 = 3;
-    if path.is_null() {
-        return E_INVALIDARG;
-    }
     // Goes through `files`, so paths on our virtual drives work too.
     let handle = super::files::CreateFileW(
         path,
@@ -135,20 +137,39 @@ extern "win64" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out:
         0,
         std::ptr::null_mut(),
     );
+    if handle as isize == -1 {
+        let error = std::io::Error::last_os_error();
+        tracing::warn!(path = name, %error, "dstorage: opening a file failed");
+        return None;
+    }
+    // SAFETY: a handle we just opened and nobody else owns.
+    Some(unsafe { std::fs::File::from_raw_handle(handle) })
+}
+
+/// The title's file at `name`, through the drive map.
+#[cfg(not(windows))]
+fn open_path(_: *const u16, name: &str) -> Option<std::fs::File> {
+    let host = super::posix::paths::host_path(name);
+    std::fs::File::open(&host)
+        .inspect_err(|error| tracing::warn!(path = name, host = %host.display(), %error, "dstorage: opening a file failed"))
+        .ok()
+}
+
+/// Opens `path` for reading; the file object owns the handle.
+extern "win64" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out: Out) -> HRESULT {
+    if path.is_null() {
+        return E_INVALIDARG;
+    }
     // SAFETY: the title passes a NUL-terminated path.
     let name = unsafe {
         let len = (0..).take_while(|&i| *path.add(i) != 0).count();
         String::from_utf16_lossy(std::slice::from_raw_parts(path, len))
     };
-    if handle as isize == -1 {
-        let error = std::io::Error::last_os_error();
-        tracing::warn!(path = name, %error, "dstorage: opening a file failed");
-        return from_win32(&error);
-    }
+    let Some(file) = open_path(path, &name) else {
+        return from_win32(&std::io::Error::last_os_error());
+    };
     let kept = name.clone();
     tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
-    // SAFETY: a handle we just opened and nobody else owns.
-    let file = unsafe { std::fs::File::from_raw_handle(handle) };
     let files = Files::new(file, Io::chosen());
     let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { files });
     if stream_log::on() {
@@ -192,7 +213,7 @@ struct QueueDesc {
     unknown: u64,
 }
 
-extern "system" fn create_queue(
+extern "win64" fn create_queue(
     _: Factory,
     desc: *const QueueDesc,
     iid: *const Guid,
@@ -336,7 +357,15 @@ impl Files {
         Files::new(std::fs::File::open(path).unwrap(), io)
     }
 
+    /// Reads at `offset`: `pread`, which any number of threads may call on
+    /// one file at once.
+    #[cfg(not(windows))]
+    fn read_at(&self, out: &mut [u8], offset: u64) -> std::io::Result<usize> {
+        self.first.read_at(out, offset)
+    }
+
     /// Reads at `offset`; as [`FileExt::seek_read`].
+    #[cfg(windows)]
     fn read_at(&self, out: &mut [u8], offset: u64) -> std::io::Result<usize> {
         use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_NO_BUFFERING, FILE_FLAG_OVERLAPPED};
         let flags = match self.io {
@@ -365,6 +394,7 @@ fn this_thread() -> usize {
     NUMBER.with(|n| *n)
 }
 
+#[cfg(windows)]
 /// Another handle to `file`, for reading; `None` if the host gives none
 /// (then the first one is used).
 fn reopen(file: &std::fs::File, flags: u32) -> Option<std::fs::File> {
@@ -381,6 +411,7 @@ fn reopen(file: &std::fs::File, flags: u32) -> Option<std::fs::File> {
     Some(unsafe { std::fs::File::from_raw_handle(handle) })
 }
 
+#[cfg(windows)]
 /// A read through a handle opened for overlapped reads, waited for.
 fn read_overlapped(file: &std::fs::File, out: &mut [u8], offset: u64) -> std::io::Result<usize> {
     use std::os::windows::io::AsRawHandle;
@@ -429,6 +460,7 @@ fn read_overlapped(file: &std::fs::File, out: &mut [u8], offset: u64) -> std::io
     })
 }
 
+#[cfg(windows)]
 /// A read past the file cache: of the whole sectors around the bytes, into
 /// a buffer of this thread's, unless `out` takes them as they are.
 fn read_direct(file: &std::fs::File, out: &mut [u8], offset: u64) -> std::io::Result<usize> {
@@ -1580,6 +1612,7 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         }
         std::thread::sleep(std::time::Duration::from_millis(1 << tries));
         tries += 1;
+        #[cfg(windows)]
         victory_gpu::kernel_will_write(out.as_ptr() as usize + done, out.len() - done);
     };
     READING.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -1600,18 +1633,22 @@ fn into_destination(
         // Raw reads land through the kernel, which does not fault into the
         // GPU side's guard on title buffers; open them first, and until the
         // bytes are there.
+        #[cfg(windows)]
         let writing = victory_gpu::kernel_writing(request.destination as usize, len);
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
         let filled = fill(out).map(drop);
-        drop(writing);
         // Again now that the bytes are there: a texture looked at in between
         // was uploaded without them (`xmem::pages_written`).
-        if super::xmem::stream_notice() {
-            victory_gpu::kernel_will_write(request.destination as usize, len);
-        } else {
-            victory_gpu::title_memory_written(request.destination as usize, len, false);
+        #[cfg(windows)]
+        {
+            drop(writing);
+            if super::xmem::stream_notice() {
+                victory_gpu::kernel_will_write(request.destination as usize, len);
+            } else {
+                victory_gpu::title_memory_written(request.destination as usize, len, false);
+            }
         }
         return filled;
     }
@@ -1761,7 +1798,7 @@ pub(crate) fn module() -> HleModule {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod tests {
     use std::os::windows::ffi::OsStrExt;
     use std::time::{Duration, Instant};

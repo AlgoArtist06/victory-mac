@@ -78,6 +78,7 @@ pub mod replay;
 mod residency;
 pub mod resource;
 pub mod root;
+mod root_blob;
 #[cfg(windows)]
 mod safecopy;
 #[cfg(windows)]

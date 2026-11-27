@@ -64,7 +64,7 @@ extern "win64" fn set_default_voice(_: This, _: *const u8) -> HRESULT {
 extern "win64" fn set_custom_voice(_: This, _: *const u8, _voice: *const c_char) -> HRESULT {
     S_OK
 }
-extern "system" fn create_stream(
+extern "win64" fn create_stream(
     _: This,
     _: *const u8,
     words: *const c_char,

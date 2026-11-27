@@ -14,7 +14,11 @@ use std::ffi::c_void;
 use std::sync::Mutex;
 
 use opus_pure::OpusDecoder;
+#[cfg(not(windows))]
+use super::posix::events::{CloseHandle, CreateEventW, HANDLE, SetEvent};
+#[cfg(windows)]
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+#[cfg(windows)]
 use windows_sys::Win32::System::Threading::{CreateEventW, SetEvent};
 
 use super::xasync::E_INVALIDARG;

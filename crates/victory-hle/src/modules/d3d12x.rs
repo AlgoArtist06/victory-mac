@@ -17,9 +17,11 @@ extern "win64" fn create_device(
     iid: *const Iid,
     out: *mut *const Object,
 ) -> HRESULT {
+    victory_gpu::resource::use_allocator(super::xmem::XMemAlloc, super::xmem::XMemFree);
+    // shortcut: on macOS tiled resources' page mappings are not served yet
+    // (`xmem` would map aliases of the frames a range shows).
     #[cfg(windows)]
     {
-        victory_gpu::resource::use_allocator(super::xmem::XMemAlloc, super::xmem::XMemFree);
         victory_gpu::resource::use_page_mapper(super::xmem::map_alias);
         victory_gpu::resource::use_many_page_mapper(super::xmem::map_aliases);
     }

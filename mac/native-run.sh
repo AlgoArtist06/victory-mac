@@ -14,7 +14,7 @@ if [ -n "$(running)" ]; then
   echo "another victory instance is running; stop it first" >&2
   exit 1
 fi
-mkdir -p "$OUT"
+mkdir -p "$OUT" && cd "$OUT"
 export ROSETTA_ADVERTISE_AVX=1
 "$EXE" run --execute "$@" "$GAME/game_scarlett_master.exe" > "$OUT/log.txt" 2>&1 &
 PID=$!

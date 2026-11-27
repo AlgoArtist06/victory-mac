@@ -98,12 +98,62 @@ pub fn load(prepared: &PreparedImage, _dir: &Path) -> Result<LoadedImage> {
     // SAFETY: just mapped and relocated, and no title code has run.
     unsafe { loaded.register_tls() };
     loaded.protect_sections()?;
+    MAPPED.lock().unwrap_or_else(|e| e.into_inner()).push((base, size));
     tracing::info!(
         base = format_args!("{base:#x}"),
         preferred = format_args!("{:#x}", info.image_base),
         "image mapped"
     );
     Ok(loaded)
+}
+
+/// Every mapped image: base and size.
+static MAPPED: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+/// The base and size of the mapped image that holds `address`.
+pub fn image_containing(address: usize) -> Option<(usize, usize)> {
+    MAPPED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .copied()
+        .find(|&(base, size)| (base..base + size).contains(&address))
+}
+
+/// The address of an export of the mapped image at `base`, by name or by
+/// ordinal (`name` below 0x10000), from its export directory. Forwarded
+/// exports are not followed.
+///
+/// # Safety
+/// `base` is a mapped image, and a name is NUL-terminated.
+pub unsafe fn export_of(base: usize, name: *const u8) -> Option<usize> {
+    // SAFETY: the image's headers and export directory.
+    unsafe {
+        let nt = base + (base as *const u8).add(0x3c).cast::<u32>().read_unaligned() as usize;
+        let dir = (nt + 0x18 + 112) as *const u32;
+        let (rva, size) = (dir.read_unaligned() as usize, dir.add(1).read_unaligned() as usize);
+        if rva == 0 {
+            return None;
+        }
+        let at = |offset: usize| ((base + rva + offset) as *const u32).read_unaligned() as usize;
+        let (ordinal_base, functions, names) = (at(0x10), at(0x14), at(0x18));
+        let (function_table, name_table, ordinal_table) = (base + at(0x1c), base + at(0x20), base + at(0x24));
+        let index = if (name as usize) < 0x1_0000 {
+            (name as usize).checked_sub(ordinal_base)?
+        } else {
+            let wanted = std::ffi::CStr::from_ptr(name.cast());
+            let i = (0..names).find(|&i| {
+                let at = base + ((name_table + 4 * i) as *const u32).read_unaligned() as usize;
+                std::ffi::CStr::from_ptr(at as *const std::ffi::c_char) == wanted
+            })?;
+            usize::from(((ordinal_table + 2 * i) as *const u16).read_unaligned())
+        };
+        if index >= functions {
+            return None;
+        }
+        let function = ((function_table + 4 * index) as *const u32).read_unaligned() as usize;
+        (function != 0 && !(rva..rva + size).contains(&function)).then_some(base + function)
+    }
 }
 
 /// A fresh read+write mapping of `size` bytes at `want` if that is free.

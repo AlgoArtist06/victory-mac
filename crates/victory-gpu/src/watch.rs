@@ -2047,7 +2047,7 @@ fn placeholder(block: usize) -> bool {
         node_preference: usize,
     }
     #[link(name = "ntdll", kind = "raw-dylib")]
-    unsafe extern "system" {
+    unsafe extern "win64" {
         fn NtQueryVirtualMemory(
             process: *mut std::ffi::c_void,
             at: *const std::ffi::c_void,

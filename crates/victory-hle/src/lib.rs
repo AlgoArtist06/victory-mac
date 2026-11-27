@@ -98,6 +98,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn strict_policy_reports_missing() {
         let r = HleResolver::new(HostPolicy::none());
@@ -105,6 +106,18 @@ mod tests {
             r.classify("api-ms-win-core-synch-l1-1-0.dll", &name("Sleep")),
             None
         );
+    }
+
+    /// On macOS there is no host: what Windows' DLLs give, we do.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn shared_api_sets_are_ours_on_macos() {
+        let r = HleResolver::default();
+        assert_eq!(
+            r.classify("api-ms-win-core-synch-l1-1-0.dll", &name("Sleep")),
+            Some(Provenance::Hle)
+        );
+        assert_eq!(r.classify("kernel32.dll", &name("NoSuchFunction")), None);
     }
 
     #[cfg(windows)]

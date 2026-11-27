@@ -2,16 +2,23 @@
 //! DLLs provide on Windows (`HostPolicy`). Registered after our other
 //! modules, so a console-specific implementation there wins.
 
+mod convert;
 mod crt;
+mod ctime;
+mod files;
 mod locale;
 mod locks;
 mod math;
 mod misc;
+mod net;
 mod objects;
 pub mod paths;
 mod printf;
 mod scanf;
+mod seh;
+pub use seh::install_signal_handlers;
 mod stdio;
+mod system;
 mod string;
 
 use crate::{HleExport, HleModule};
@@ -21,6 +28,9 @@ pub(crate) fn modules() -> Vec<HleModule> {
     kernel.extend(misc::exports());
     kernel.extend(locks::exports());
     kernel.extend(objects::exports());
+    kernel.extend(seh::exports());
+    kernel.extend(files::exports());
+    kernel.extend(system::exports());
     vec![
         HleModule {
             name: "posix kernel",
@@ -29,15 +39,52 @@ pub(crate) fn modules() -> Vec<HleModule> {
                 "kernelbase.dll",
                 "ntdll.dll",
                 "api-ms-win-core-*",
+                "advapi32.dll",
+                "bcrypt.dll",
+                "ole32.dll",
+                "user32.dll",
+                "ext-ms-win-rtcore-ntuser-*",
             ],
             exports: kernel,
         },
         HleModule {
+            name: "posix sockets",
+            dlls: &["ws2_32.dll"],
+            exports: net::exports(),
+        },
+        HleModule {
             name: "posix crt",
             dlls: &["api-ms-win-crt-*", "ucrtbase.dll"],
-            exports: [crt::exports(), stdio::exports(), locale::exports(), string::exports(), math::exports()].concat(),
+            exports: [crt::exports(), stdio::exports(), locale::exports(), string::exports(), math::exports(), ctime::exports(), convert::exports()].concat(),
         },
     ]
+}
+
+/// Kernel events for other modules, with the Windows signatures they use
+/// there (`windows_sys`'s), so the same code builds on both.
+#[allow(non_snake_case)]
+pub(crate) mod events {
+    use std::ffi::c_void;
+
+    pub type HANDLE = *mut c_void;
+
+    /// # Safety
+    /// As Windows' (no pointer is read here).
+    pub unsafe fn CreateEventW(_: *const c_void, manual: i32, initial: i32, _: *const u16) -> HANDLE {
+        super::objects::CreateEventW(std::ptr::null(), manual, initial, std::ptr::null()) as HANDLE
+    }
+
+    /// # Safety
+    /// As Windows'.
+    pub unsafe fn SetEvent(event: HANDLE) -> i32 {
+        super::objects::SetEvent(event as usize)
+    }
+
+    /// # Safety
+    /// As Windows'.
+    pub unsafe fn CloseHandle(handle: HANDLE) -> i32 {
+        super::objects::CloseHandle(handle as usize)
+    }
 }
 
 pub(crate) type Bool = i32;
@@ -72,18 +119,26 @@ pub(crate) fn teb_field<T: Copy + Default>(offset: usize) -> T {
     }
 }
 
-const LAST_ERROR: usize = 0x68;
+const LAST_ERROR_AT: usize = 0x68;
 
-pub(crate) fn set_last_error(code: u32) {
-    let teb = teb();
-    if teb != 0 {
+thread_local! {
+    /// The last error of a thread without a thread block (one of ours).
+    static LAST_ERROR: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+pub fn set_last_error(code: u32) {
+    match teb() {
+        0 => LAST_ERROR.set(code),
         // SAFETY: inside the thread's block.
-        unsafe { ((teb + LAST_ERROR) as *mut u32).write(code) };
+        teb => unsafe { ((teb + LAST_ERROR_AT) as *mut u32).write(code) },
     }
 }
 
 pub(crate) fn last_error() -> u32 {
-    teb_field(LAST_ERROR)
+    match teb() {
+        0 => LAST_ERROR.get(),
+        _ => teb_field(LAST_ERROR_AT),
+    }
 }
 
 pub(crate) fn current_thread_id() -> u32 {

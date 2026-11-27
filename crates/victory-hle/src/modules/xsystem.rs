@@ -133,7 +133,6 @@ static ANALYTICS_VTABLE: Methods<4> = Methods([
 /// The device type is not a runtime call: code linked into the title reads
 /// `ConsoleMode` from this key (`RegOpenKeyW`, `RegQueryValueExW`) and
 /// takes a missing value for a PC.
-#[cfg(windows)]
 mod device_type {
     #![allow(non_snake_case)]
 
@@ -141,8 +140,20 @@ mod device_type {
 
     use victory_gpu::console::{self, Console};
 
+    #[cfg(windows)]
     use crate::modules::files::host;
     use crate::{HleModule, hle_export};
+
+    /// Other keys: the host's registry on Windows; on macOS there is none.
+    #[cfg(not(windows))]
+    macro_rules! host {
+        ("advapi32.dll", "RegCloseKey": $ty:ty) => {
+            |_| SUCCESS
+        };
+        ("advapi32.dll", $name:literal: extern "win64" fn($($arg:ty),* $(,)?) -> u32) => {
+            |$(_: $arg),*| FILE_NOT_FOUND
+        };
+    }
 
     type Key = *mut c_void;
     const LOCAL_MACHINE: Key = 0xffff_ffff_8000_0002_u64 as Key;
@@ -339,6 +350,7 @@ mod device_type {
             assert_eq!(again, oem());
         }
 
+        #[cfg(windows)]
         #[test]
         fn other_keys_reach_the_host() {
             let mut key = std::ptr::null_mut();
@@ -362,7 +374,6 @@ mod device_type {
         }
     }
 }
-#[cfg(windows)]
 pub(crate) use device_type::module;
 
 #[cfg(test)]

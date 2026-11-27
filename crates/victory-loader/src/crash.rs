@@ -439,17 +439,7 @@ fn gpr(context: &mut CONTEXT, n: u8) -> &mut u64 {
     }
 }
 
-/// The status flags `cmp a, b` leaves (CF, PF, AF, ZF, SF, OF) as `EFLAGS` bits.
-pub(crate) fn cmp_flags(a: u64, b: u64) -> u32 {
-    let r = a.wrapping_sub(b);
-    u32::from(a < b)
-        | u32::from((r as u8).count_ones().is_multiple_of(2)) << 2
-        | (((a ^ b ^ r) >> 4) as u32 & 1) << 4
-        | u32::from(r == 0) << 6
-        | ((r >> 63) as u32) << 7
-        | ((((a ^ b) & (a ^ r)) >> 63) as u32) << 11
-}
-pub(crate) const CMP_FLAGS: u32 = 0x8d5;
+pub(crate) use crate::console_insn::{CMP_FLAGS, cmp_flags};
 
 /// SSE4a's `extrq`/`insertq` (register forms, the only ones there are) on
 /// the saved XMM registers; returns the instruction's length.

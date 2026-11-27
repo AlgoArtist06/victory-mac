@@ -80,7 +80,12 @@ fn title_path(module: *mut c_void) -> Option<String> {
     } else {
         module as usize
     };
-    Some(runtime::image_path(base)?.to_string_lossy().into_owned())
+    let path = runtime::image_path(base)?;
+    // The title sees its files on its own drives.
+    #[cfg(target_os = "macos")]
+    return Some(crate::modules::posix::paths::windows_path(&path));
+    #[cfg(not(target_os = "macos"))]
+    Some(path.to_string_lossy().into_owned())
 }
 
 /// `GetModuleFileName`'s contract: copy with a NUL; if it does not fit,
@@ -638,21 +643,37 @@ mod host {
     }
 
     pub(super) fn get_module_file_name_w(_: *mut c_void, _: *mut u16, _: u32) -> u32 {
+        set_last_error(super::ERROR_MOD_NOT_FOUND);
         0
     }
 
     pub(super) fn get_module_file_name_a(_: *mut c_void, _: *mut u8, _: u32) -> u32 {
+        set_last_error(super::ERROR_MOD_NOT_FOUND);
         0
     }
 
-    pub(super) fn set_last_error(_: u32) {}
+    pub(super) fn set_last_error(code: u32) {
+        crate::modules::posix::set_last_error(code)
+    }
 
     pub(super) fn load_library_ex_w(_: *const u16, _: *mut c_void, _: u32) -> *mut c_void {
         std::ptr::null_mut()
     }
 
-    pub(super) fn get_proc_address(_: *mut c_void, _: *const u8) -> *mut c_void {
-        std::ptr::null_mut()
+    /// A title image's export (no other modules exist here).
+    pub(super) fn get_proc_address(module: *mut c_void, name: *const u8) -> *mut c_void {
+        if crate::runtime::image_path(module as usize).is_none() {
+            set_last_error(super::ERROR_MOD_NOT_FOUND);
+            return std::ptr::null_mut();
+        }
+        // SAFETY: a mapped title image; a name is NUL-terminated.
+        match unsafe { victory_loader::export_of(module as usize, name) } {
+            Some(address) => address as *mut c_void,
+            None => {
+                set_last_error(127); // ERROR_PROC_NOT_FOUND
+                std::ptr::null_mut()
+            }
+        }
     }
 
     pub(super) fn free_library(_: *mut c_void) -> i32 {

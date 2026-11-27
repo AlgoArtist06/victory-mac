@@ -21,7 +21,7 @@
 //!    point on a thread with the stack size the image asks for; from then
 //!    on, pass every thread start and end on to the attached images.
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 mod console_insn;
 #[cfg(windows)]
 mod crash;
@@ -62,10 +62,21 @@ pub use crash::{
 };
 #[cfg(target_os = "macos")]
 pub use crash_macos::log_crash;
+
+/// Emulates the console-only instruction a fault stopped at, if it is one,
+/// and steps over it: true then. `context` is the fault's Windows `CONTEXT`.
+///
+/// # Safety
+/// `context` is the faulting thread's context, being dispatched.
+#[cfg(target_os = "macos")]
+pub unsafe fn emulate_console_instruction(context: *mut std::ffi::c_void) -> bool {
+    // SAFETY: the same layout, forwarded from the caller.
+    unsafe { console_insn::emulate(&mut *context.cast::<console_insn::CONTEXT>()) == -1 }
+}
 #[cfg(any(windows, target_os = "macos"))]
 pub use images::{BindReport, MissingImport, WithTitleDlls, load_title_dll, load_title_dlls};
 #[cfg(target_os = "macos")]
-pub use macos::{LoadedImage, enter_thread, enter_title_thread, load, thread_id};
+pub use macos::{LoadedImage, enter_thread, enter_title_thread, export_of, image_containing, load, thread_id};
 pub use prepare::{PrepareError, PreparedImage, prepare};
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use profile::profile_on_schedule;

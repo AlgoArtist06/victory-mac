@@ -278,6 +278,7 @@ pub fn run(
     }
     #[cfg(not(windows))]
     {
+        victory_hle::modules::posix::install_signal_handlers();
         // SAFETY: imports are bound; from here on we run title code.
         let main = unsafe { Arc::new(image).spawn_main(dlls)? };
         let code = main

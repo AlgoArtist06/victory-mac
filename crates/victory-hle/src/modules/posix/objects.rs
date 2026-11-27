@@ -5,9 +5,10 @@
 //! kinds at once is simple; per-object waiters if contention shows.
 #![allow(non_snake_case)]
 
+use std::any::Any;
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::{Condvar, LazyLock, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard};
 use std::time::Instant;
 
 use super::misc::{CURRENT_PROCESS, CURRENT_THREAD};
@@ -41,6 +42,8 @@ enum Object {
     Mutex { owner: u32, depth: u32 },
     Semaphore { count: i32, max: i32 },
     Thread { id: u32, exit: Option<u32>, suspended: bool },
+    /// Files, searches and the like (`insert_other`): always signalled.
+    Other(Arc<dyn Any + Send + Sync>),
 }
 
 impl Object {
@@ -50,6 +53,7 @@ impl Object {
             Object::Mutex { owner, .. } => owner == 0 || owner == me,
             Object::Semaphore { count, .. } => count > 0,
             Object::Thread { exit, .. } => exit.is_some(),
+            Object::Other(_) => true,
         }
     }
 
@@ -115,7 +119,24 @@ fn change(handle: usize, f: impl FnOnce(&mut Object) -> Result<(), u32>) -> Bool
     }
 }
 
-extern "win64" fn CloseHandle(handle: usize) -> Bool {
+/// A handle for an object of another module's kind.
+pub(super) fn insert_other(object: Arc<dyn Any + Send + Sync>) -> usize {
+    insert(Object::Other(object))
+}
+
+/// The object of kind `T` behind `handle`; `ERROR_INVALID_HANDLE` if none.
+pub(super) fn other<T: Any + Send + Sync>(handle: usize) -> Option<Arc<T>> {
+    let found = match table().objects.get(&handle) {
+        Some(Object::Other(o)) => o.clone().downcast::<T>().ok(),
+        _ => None,
+    };
+    if found.is_none() {
+        set_last_error(error::INVALID_HANDLE);
+    }
+    found
+}
+
+pub(super) extern "win64" fn CloseHandle(handle: usize) -> Bool {
     if handle == CURRENT_PROCESS || handle == CURRENT_THREAD {
         return TRUE;
     }
@@ -128,7 +149,7 @@ extern "win64" fn CloseHandle(handle: usize) -> Bool {
 }
 
 /// ponytail: named objects are not shared by name; each call makes one.
-extern "win64" fn CreateEventW(_: *const c_void, manual: Bool, initial: Bool, _name: *const u16) -> usize {
+pub(super) extern "win64" fn CreateEventW(_: *const c_void, manual: Bool, initial: Bool, _name: *const u16) -> usize {
     insert(Object::Event {
         manual: manual != 0,
         set: initial != 0,
@@ -139,7 +160,7 @@ extern "win64" fn CreateEventA(attributes: *const c_void, manual: Bool, initial:
     CreateEventW(attributes, manual, initial, std::ptr::null())
 }
 
-extern "win64" fn SetEvent(handle: usize) -> Bool {
+pub(super) extern "win64" fn SetEvent(handle: usize) -> Bool {
     change(handle, |o| match o {
         Object::Event { set, .. } => {
             *set = true;
@@ -272,11 +293,41 @@ extern "win64" fn WaitForMultipleObjects(count: u32, handles: *const usize, all:
     wait(handles, all != 0, ms)
 }
 
-type ThreadStart = unsafe extern "win64" fn(*mut c_void) -> u32;
+pub(super) type ThreadStart = unsafe extern "win64" fn(*mut c_void) -> u32;
 
 const CREATE_SUSPENDED: u32 = 4;
 
 extern "win64" fn CreateThread(
+    attributes: *const c_void,
+    stack: usize,
+    start: ThreadStart,
+    param: *mut c_void,
+    flags: u32,
+    id_out: *mut u32,
+) -> usize {
+    create_thread(attributes, stack, start, param, flags, id_out)
+}
+
+thread_local! {
+    /// The handle of the title thread running here, if it is one we made.
+    static CURRENT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Ends the calling title thread with `code`, as `ExitThread` does.
+/// ponytail: the thread's DLL detach notices are not sent.
+pub(super) fn exit_thread(code: u32) -> ! {
+    let handle = CURRENT.get();
+    change(handle, |o| {
+        if let Object::Thread { exit, .. } = o {
+            *exit = Some(code);
+        }
+        Ok(())
+    });
+    // SAFETY: ends this thread; nothing below it on the stack is used again.
+    unsafe { libc::pthread_exit(std::ptr::null_mut()) }
+}
+
+pub(super) fn create_thread(
     _: *const c_void,
     stack: usize,
     start: ThreadStart,
@@ -297,6 +348,7 @@ extern "win64" fn CreateThread(
         .spawn(move || {
             // SAFETY: a title thread runs title code from here on.
             unsafe { victory_loader::enter_title_thread() };
+            CURRENT.set(handle);
             let id = current_thread_id();
             let _ = tx.send(id);
             let mut t = table();

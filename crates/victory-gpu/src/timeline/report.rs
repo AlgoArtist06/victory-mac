@@ -17,12 +17,12 @@ pub(super) struct Threads {
 }
 
 #[link(name = "kernel32")]
-unsafe extern "system" {
+unsafe extern "win64" {
     fn QueryThreadCycleTime(thread: *mut std::ffi::c_void, cycles: *mut u64) -> i32;
 }
 
 #[link(name = "ntdll")]
-unsafe extern "system" {
+unsafe extern "win64" {
     fn NtQueryInformationThread(
         thread: *mut std::ffi::c_void,
         class: i32,
