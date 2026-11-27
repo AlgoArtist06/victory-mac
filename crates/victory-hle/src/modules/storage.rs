@@ -56,7 +56,7 @@ fn folder() -> Option<String> {
     #[cfg(windows)]
     return super::files::mount(&storage).map(|letter| format!("{letter}:\\"));
     #[cfg(not(windows))]
-    None
+    super::posix::paths::mount(&storage).map(|letter| format!("{letter}:\\"))
 }
 
 extern "win64" fn path_size(_: This, out: *mut usize) -> HRESULT {

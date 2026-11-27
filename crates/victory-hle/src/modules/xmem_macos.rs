@@ -375,6 +375,12 @@ fn query(address: usize) -> BasicInformation {
     }
 }
 
+/// Whether `len` bytes from `at` can be read now (for crash reports).
+pub(crate) fn readable(at: usize, len: usize) -> bool {
+    let info = query(at);
+    info.state == MEM_COMMIT && host_protection(info.protect) & libc::PROT_READ != 0 && info.base + info.region_size >= at + len
+}
+
 extern "win64" fn VirtualQueryEx(_process: usize, address: *const c_void, out: *mut BasicInformation, len: usize) -> usize {
     if len < size_of::<BasicInformation>() {
         set_last_error(24); // ERROR_BAD_LENGTH

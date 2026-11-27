@@ -15,6 +15,20 @@ pub fn mount_at(letter: char, dir: &Path) {
     }
 }
 
+/// Gives `dir` a drive letter (the same one if it has one already): the
+/// highest free letter below `Z:`, which is the Mac's root.
+pub fn mount(dir: &Path) -> Option<char> {
+    let mut mounts = MOUNTS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(i) = mounts.iter().position(|m| m.as_deref() == Some(dir)) {
+        return Some((b'A' + i as u8) as char);
+    }
+    let i = (3..25).rev().find(|&i| mounts[i].is_none())?;
+    mounts[i] = Some(dir.to_owned());
+    let letter = (b'A' + i as u8) as char;
+    tracing::info!(drive = %letter, root = %dir.display(), "virtual drive");
+    Some(letter)
+}
+
 /// The macOS path for a Windows one: `\\?\` dropped, the drive replaced by
 /// its folder, backslashes made slashes. A path without a drive is left
 /// relative (to the process's folder).
@@ -94,5 +108,9 @@ mod tests {
         assert_eq!(host_path(r"rel\file"), Path::new("rel/file"));
         assert_eq!(windows_path(Path::new("/games/title/a/b")), r"G:\a\b");
         assert_eq!(windows_path(Path::new("/Users/me")), r"Z:\Users\me");
+        let storage = mount(Path::new("/saves")).expect("a free letter");
+        assert_eq!(storage, 'Y');
+        assert_eq!(mount(Path::new("/saves")), Some('Y'), "the same folder keeps its letter");
+        assert_eq!(host_path(r"Y:\a.sav"), Path::new("/saves/a.sav"));
     }
 }

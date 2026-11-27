@@ -816,11 +816,73 @@ fn describe(address: u64) -> String {
     }
 }
 
+/// Every other thread's title frames, the threads stopped first (we are
+/// crashing): `thread n: frames`, for threads in title code only.
+fn other_threads() -> Vec<String> {
+    unsafe extern "C" {
+        static mach_task_self_: u32;
+        fn mach_thread_self() -> u32;
+        fn task_threads(task: u32, threads: *mut *mut u32, count: *mut u32) -> i32;
+        fn thread_suspend(thread: u32) -> i32;
+        fn thread_get_state(thread: u32, flavor: i32, state: *mut u64, count: *mut u32) -> i32;
+    }
+    const X86_THREAD_STATE64: i32 = 4;
+    let mut out = Vec::new();
+    let (mut threads, mut count) = (std::ptr::null_mut(), 0u32);
+    // SAFETY: Mach queries about our own task; the list is the kernel's.
+    unsafe {
+        if task_threads(mach_task_self_, &mut threads, &mut count) != 0 {
+            return out;
+        }
+        let me = mach_thread_self();
+        for i in 0..count as usize {
+            let thread = *threads.add(i);
+            if thread == me || thread_suspend(thread) != 0 {
+                continue;
+            }
+            let mut state = [0u64; 21];
+            let mut words = 42u32;
+            if thread_get_state(thread, X86_THREAD_STATE64, state.as_mut_ptr(), &mut words) != 0 {
+                continue;
+            }
+            let mut context: Context = std::mem::zeroed();
+            for (windows, mac) in FROM_MAC.iter().enumerate() {
+                context.gpr[windows] = state[*mac];
+            }
+            context.rip = state[16];
+            // Stopped in our own code (a wait, mostly): from the first
+            // return address into title code on its stack.
+            if victory_loader::image_containing(context.rip as usize).is_none() {
+                let rsp = context.gpr[RSP];
+                let found = (0..2048u64).map(|i| rsp + 8 * i).take_while(|&at| crate::modules::xmem::readable(at as usize, 8)).find(|&at| {
+                    let v = (at as *const u64).read();
+                    victory_loader::image_containing(v as usize).is_some()
+                        && crate::modules::xmem::readable(v as usize - 6, 6)
+                        && (*((v - 5) as *const u8) == 0xe8 || *((v - 6) as *const u8) == 0xff || *((v - 2) as *const u8) == 0xff || *((v - 3) as *const u8) == 0xff)
+                });
+                let Some(at) = found else { continue };
+                context.rip = (at as *const u64).read();
+                context.gpr[RSP] = at + 8;
+            }
+            let walk = frames_where(&context, |rsp| crate::modules::xmem::readable(rsp as usize, 8));
+            if walk.iter().any(|f| f.contains('+')) {
+                out.push(format!("thread {i}: {}", walk.join(" < ")));
+            }
+        }
+    }
+    out
+}
+
 /// The frames from `context` up, as `module+offset`, at most 24.
 fn frames(context: &Context) -> Vec<String> {
+    frames_where(context, on_stack)
+}
+
+/// As [`frames`], walking while `fine(rsp)`.
+fn frames_where(context: &Context, fine: impl Fn(u64) -> bool) -> Vec<String> {
     let mut walk = *context;
     let mut out = Vec::new();
-    while out.len() < 24 && on_stack(walk.gpr[RSP]) && walk.rip != 0 {
+    while out.len() < 24 && fine(walk.gpr[RSP]) && walk.rip != 0 {
         out.push(describe(walk.rip));
         if step(0, &mut walk).is_none() {
             break;
@@ -840,18 +902,34 @@ fn registers(context: &Context) -> String {
         // SAFETY: slots of the thread's own stack.
         .map(|at| format!("{:#x}", unsafe { (at as *const u64).read() }))
         .collect();
-    format!("{}\n  stack slots from rsp: {}", regs.join(" "), slots.join(" "))
+    let memory: Vec<String> = NAMES
+        .iter()
+        .zip(context.gpr)
+        .filter(|&(_, v)| v > 0x10000 && crate::modules::xmem::readable(v as usize, 48))
+        .map(|(n, v)| {
+            // SAFETY: readable, checked just above.
+            let bytes = unsafe { std::slice::from_raw_parts(v as *const u64, 6) };
+            format!("[{n}] {:x?}", bytes)
+        })
+        .collect();
+    format!(
+        "{}\n  stack slots from rsp: {}\n  memory: {}",
+        regs.join(" "),
+        slots.join(" "),
+        memory.join(" ")
+    )
 }
 
 fn unhandled(record: &ExceptionRecord, context: &Context) -> ! {
     let text = format!(
-        "unhandled exception {:#x} at {} ({} parameters: {:x?})\n  frames: {}\n  {}",
+        "unhandled exception {:#x} at {} ({} parameters: {:x?})\n  frames: {}\n  {}\n  other threads:\n    {}",
         record.code,
         describe(record.address),
         record.count,
         &record.info[..record.count.min(15) as usize],
         frames(context).join(" < "),
-        registers(context)
+        registers(context),
+        other_threads().join("\n    ")
     );
     tracing::error!("{text}");
     victory_loader::log_crash(&text);
@@ -1054,7 +1132,55 @@ const INTEGER_DIVIDE_BY_ZERO: u32 = 0xC000_0094;
 /// Turns faults in title code into Windows exceptions, as Windows does:
 /// the title's own handlers see them, and an unhandled one is reported
 /// with the title's stack.
+/// First-hit probes (`VICTORY_PROBE=<offset>[,<offset>..]`, hex offsets into
+/// the executable): each byte is replaced by `int3`; the first time a
+/// thread reaches it, the byte comes back and the hit is logged.
+static PROBES: OnceLock<Vec<(usize, u8)>> = OnceLock::new();
+
+fn set_probes() {
+    let Some(base) = crate::runtime::main_image() else { return };
+    let wanted: Vec<usize> = std::env::var("VICTORY_PROBE")
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|t| usize::from_str_radix(t.trim().trim_start_matches("0x"), 16).ok())
+        .map(|offset| base + offset)
+        .collect();
+    let probes = wanted
+        .into_iter()
+        .filter_map(|at| {
+            let page = at & !4095;
+            // SAFETY: a byte of the title's code, made writable for the patch.
+            unsafe {
+                if libc::mprotect(page as *mut c_void, 4096, libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC) != 0 {
+                    return None;
+                }
+                let was = (at as *const u8).read();
+                (at as *mut u8).write(0xcc);
+                Some((at, was))
+            }
+        })
+        .collect::<Vec<_>>();
+    if !probes.is_empty() {
+        tracing::info!(count = probes.len(), "probes set");
+    }
+    let _ = PROBES.set(probes);
+}
+
+/// A probe's `int3` at `at`: its byte back, the hit noted. True if it was one.
+fn probe_hit(at: u64) -> bool {
+    let Some(&(_, was)) = PROBES.get().and_then(|p| p.iter().find(|p| p.0 as u64 == at)) else {
+        return false;
+    };
+    // SAFETY: the probe's byte, writable since `set_probes`.
+    unsafe { (at as *mut u8).write(was) };
+    let line = format!("VIctory probe hit: {} on thread {}\n", describe(at), super::current_thread_id());
+    // SAFETY: a plain write to standard error (safe in a signal handler).
+    unsafe { libc::write(2, line.as_ptr().cast(), line.len()) };
+    true
+}
+
 pub fn install_signal_handlers() {
+    set_probes();
     for signal in [libc::SIGSEGV, libc::SIGBUS, libc::SIGILL, libc::SIGTRAP, libc::SIGFPE] {
         // SAFETY: a handler of ours, with its information.
         unsafe {
@@ -1095,6 +1221,10 @@ extern "C" fn on_signal(signal: i32, info: *mut libc::siginfo_t, uc: *mut c_void
             // SAFETY: the byte before the resume address, in title code.
             if unsafe { *((rip - 1) as *const u8) } == 0xcc {
                 rip -= 1;
+            }
+            if probe_hit(rip) {
+                mc.ss[16] = rip;
+                return;
             }
             (BREAKPOINT, vec![0])
         }

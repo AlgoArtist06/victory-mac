@@ -361,27 +361,59 @@ fn peb() -> usize {
     *PEB.get_or_init(|| Box::leak(vec![0u8; 0x1000].into_boxed_slice()).as_mut_ptr() as usize)
 }
 
-/// Sets up the calling thread for title code: a thread block at `gs:[0x30]`,
-/// and its static TLS blocks, each a copy of its image's template, in an
-/// array at `gs:[0x58]` (also in the thread block).
-/// ponytail: the blocks are leaked; freeing them at thread end comes with
-/// the host layer's threads.
+/// A thread's thread block and TLS blocks, freed when the thread ends.
+struct Entered {
+    _block: Box<[u8]>,
+    _tls: Vec<Box<[u8]>>,
+    _array: Box<[usize]>,
+    /// Whether the attached images heard of the thread (and so hear of its end).
+    attached: bool,
+}
+
+impl Drop for Entered {
+    /// The thread ends: the images hear of it while its blocks are still
+    /// there (`DLL_THREAD_DETACH`), then they go.
+    fn drop(&mut self) {
+        const THREAD_DETACH: u32 = 3;
+        if self.attached {
+            let images = ATTACHED.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            for image in images.iter().rev() {
+                // SAFETY: the thread's blocks are still set up.
+                unsafe { image.notify(THREAD_DETACH) };
+            }
+        }
+        // SAFETY: our pthread slots; the blocks go after this.
+        unsafe { std::arch::asm!("mov qword ptr gs:[0x30], 0", "mov qword ptr gs:[0x58], 0", options(nostack)) };
+    }
+}
+
+thread_local! {
+    static ENTERED: std::cell::RefCell<Option<Entered>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Sets up the calling thread for title code, once: a thread block at
+/// `gs:[0x30]`, and its static TLS blocks, each a copy of its image's
+/// template, in an array at `gs:[0x58]` (also in the thread block).
 pub fn enter_thread() {
+    if ENTERED.with_borrow(Option::is_some) {
+        return;
+    }
     let templates = TLS.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    let array: Vec<usize> = templates
+    let mut tls: Vec<Box<[u8]>> = Vec::new();
+    let mut array: Box<[usize]> = templates
         .iter()
         .map(|t| {
             let Some(t) = t else { return 0 };
             let mut block = vec![0u8; t.len + t.zero_fill].into_boxed_slice();
             // SAFETY: the template lies in a mapped image.
-            unsafe {
-                std::ptr::copy_nonoverlapping(t.start as *const u8, block.as_mut_ptr(), t.len)
-            };
-            Box::leak(block).as_mut_ptr() as usize
+            unsafe { std::ptr::copy_nonoverlapping(t.start as *const u8, block.as_mut_ptr(), t.len) };
+            let at = block.as_mut_ptr() as usize;
+            tls.push(block);
+            at
         })
         .collect();
-    let array = Box::leak(array.into_boxed_slice()).as_ptr() as usize;
-    let block = Box::leak(vec![0u8; teb::SIZE].into_boxed_slice()).as_mut_ptr() as usize;
+    let mut block = vec![0u8; teb::SIZE].into_boxed_slice();
+    let at = block.as_mut_ptr() as usize;
     // SAFETY: plain queries about the calling thread.
     let (stack_base, stack_size, tid) = unsafe {
         let me = libc::pthread_self();
@@ -396,26 +428,52 @@ pub fn enter_thread() {
     let fields = [
         (teb::STACK_BASE, stack_base),
         (teb::STACK_LIMIT, stack_base - stack_size),
-        (teb::SELF, block),
+        (teb::SELF, at),
         (teb::PROCESS_ID, std::process::id() as usize),
         (teb::THREAD_ID, thread_id(tid) as usize),
-        (teb::TLS_ARRAY, array),
+        (teb::TLS_ARRAY, array.as_mut_ptr() as usize),
         (teb::PEB, peb()),
     ];
     for (offset, value) in fields {
         // SAFETY: inside the block just allocated.
-        unsafe { ((block + offset) as *mut usize).write(value) };
+        unsafe { ((at + offset) as *mut usize).write(value) };
     }
+    let array_at = array.as_mut_ptr() as usize;
     // SAFETY: pthread slots 6 and 11 (gs:0x30, gs:0x58) are unused by libSystem.
     unsafe {
         std::arch::asm!(
             "mov gs:[0x30], {teb}",
             "mov gs:[0x58], {tls}",
-            teb = in(reg) block,
-            tls = in(reg) array,
+            teb = in(reg) at,
+            tls = in(reg) array_at,
             options(nostack),
         )
     };
+    ENTERED.set(Some(Entered { _block: block, _tls: tls, _array: array, attached: false }));
+}
+
+/// Sets up every thread that starts from now on for title code, as Windows
+/// gives every thread its thread block and TLS: our runtime's threads call
+/// the title back too (audio, storage, asynchronous work).
+pub fn enter_every_thread() {
+    type Hook = extern "C" fn(u32, libc::pthread_t, *mut std::ffi::c_void, usize);
+    unsafe extern "C" {
+        fn pthread_introspection_hook_install(hook: Hook) -> Option<Hook>;
+    }
+    static PREVIOUS: std::sync::OnceLock<Option<Hook>> = std::sync::OnceLock::new();
+    extern "C" fn on_thread(event: u32, thread: libc::pthread_t, at: *mut std::ffi::c_void, size: usize) {
+        const START: u32 = 2;
+        if event == START {
+            // SAFETY: a new thread, before its own code: as Windows' loader
+            // tells the images of each thread.
+            unsafe { enter_title_thread() };
+        }
+        if let Some(Some(previous)) = PREVIOUS.get() {
+            previous(event, thread, at, size);
+        }
+    }
+    // SAFETY: installs our hook, keeping the one before.
+    PREVIOUS.get_or_init(|| unsafe { pthread_introspection_hook_install(on_thread) });
 }
 
 /// Images attached so far, in order: each hears of every thread that starts.
@@ -429,6 +487,10 @@ static ATTACHED: Mutex<Vec<LoadedImage>> = Mutex::new(Vec::new());
 pub unsafe fn enter_title_thread() {
     const THREAD_ATTACH: u32 = 2;
     enter_thread();
+    let told = ENTERED.with_borrow_mut(|e| e.as_mut().map(|e| std::mem::replace(&mut e.attached, true)));
+    if told != Some(false) {
+        return;
+    }
     let images = ATTACHED.lock().unwrap_or_else(|e| e.into_inner()).clone();
     for image in &images {
         // SAFETY: forwarded from the caller.

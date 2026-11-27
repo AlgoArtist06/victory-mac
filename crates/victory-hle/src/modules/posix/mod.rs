@@ -19,6 +19,7 @@ mod seh;
 pub use seh::install_signal_handlers;
 mod stdio;
 mod system;
+mod wasapi;
 mod string;
 
 use crate::{HleExport, HleModule};

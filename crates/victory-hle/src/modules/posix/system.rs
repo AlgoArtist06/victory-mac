@@ -635,7 +635,17 @@ extern "win64" fn CoTaskMemFree(p: *mut c_void) {
 }
 
 /// No COM classes are registered.
-extern "win64" fn CoCreateInstance(_: *const c_void, _: *mut c_void, _: u32, _: *const c_void, out: *mut *mut c_void) -> i32 {
+extern "win64" fn CoCreateInstance(class: *const [u8; 16], _: *mut c_void, _: u32, iid: *const [u8; 16], out: *mut *mut c_void) -> i32 {
+    let text = |g: *const [u8; 16]| {
+        let mut out = [0u16; 39];
+        StringFromGUID2(g, out.as_mut_ptr(), 39);
+        String::from_utf16_lossy(&out[..38])
+    };
+    // SAFETY: the caller's class id.
+    if !class.is_null() && unsafe { *class } == super::wasapi::CLSID_MM_DEVICE_ENUMERATOR {
+        return super::wasapi::create_enumerator(iid, out);
+    }
+    tracing::info!(class = text(class), iid = text(iid), "CoCreateInstance: no such class");
     if !out.is_null() {
         // SAFETY: the caller's out pointer.
         unsafe { out.write(std::ptr::null_mut()) };

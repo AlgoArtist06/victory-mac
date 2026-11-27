@@ -329,11 +329,13 @@ extern "win64" fn FlsFree(index: u32) -> Bool {
 
 extern "win64" fn FlsGetValue(index: u32) -> usize {
     set_last_error(0);
-    FLS.with_borrow(|v| v.get(index as usize).copied().unwrap_or(0))
+    // During the thread's end its values may be gone already: then none.
+    FLS.try_with(|v| v.borrow().get(index as usize).copied().unwrap_or(0)).unwrap_or(0)
 }
 
 extern "win64" fn FlsSetValue(index: u32, value: usize) -> Bool {
-    FLS.with_borrow_mut(|v| {
+    let _ = FLS.try_with(|v| {
+        let mut v = v.borrow_mut();
         if v.len() <= index as usize {
             v.resize(index as usize + 1, 0);
         }
