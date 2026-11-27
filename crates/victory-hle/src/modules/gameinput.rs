@@ -546,11 +546,77 @@ impl State {
     }
 }
 
+/// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
+/// 0.2 s that long after input starts (`<from>-<to>:<key>`: all that
+/// time), with or without focus. A key is a
+/// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
+/// `Left`, `Right` (the stand-in pad's table maps them to buttons).
+#[cfg(feature = "diagnostics")]
+fn scripted() -> Vec<u8> {
+    static SCRIPT: LazyLock<(Instant, Vec<(Duration, Duration, u8)>)> = LazyLock::new(|| {
+        let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
+        let keys = list.split(',').filter_map(|entry| {
+            let (at, key) = entry.split_once(':')?;
+            let vk = match key.trim() {
+                "Enter" => 0x0D,
+                "Esc" => 0x1B,
+                "Tab" => 0x09,
+                "Back" => 0x08,
+                "Up" => 0x26,
+                "Down" => 0x28,
+                "Left" => 0x25,
+                "Right" => 0x27,
+                k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
+                    k.as_bytes()[0].to_ascii_uppercase()
+                }
+                _ => return None,
+            };
+            let time = |t: &str| Duration::try_from_secs_f64(t.trim().parse().ok()?).ok();
+            let (from, to) = match at.split_once('-') {
+                Some((from, to)) => (time(from)?, time(to)?),
+                None => (time(at)?, time(at)? + Duration::from_millis(200)),
+            };
+            Some((from, to, vk))
+        });
+        (Instant::now(), keys.collect())
+    });
+    let (start, keys) = &*SCRIPT;
+    let now = start.elapsed();
+    keys.iter()
+        .filter(|&&(from, to, _)| (from..to).contains(&now))
+        .map(|&(_, _, vk)| vk)
+        .collect()
+}
+
+
 #[cfg(windows)]
 fn host() -> Box<dyn Source> {
     Box::new(host::Host::default())
 }
 
+/// The PC keyboard's scan code (set 1, 0xE0xx when extended) of a
+/// virtual key, for the keys `VICTORY_KEYS` names.
+#[cfg(not(windows))]
+fn scan_code(vk: u8) -> u32 {
+    const LETTERS: &[u8; 26] = b"\x1e\x30\x2e\x20\x12\x21\x22\x23\x17\x24\x25\x26\x32\x31\x18\x19\x10\x13\x1f\x14\x16\x2f\x11\x2d\x15\x2c";
+    match vk {
+        0x0D => 0x1C,
+        0x1B => 0x01,
+        0x09 => 0x0F,
+        0x08 => 0x0E,
+        0x26 => 0xE048,
+        0x28 => 0xE050,
+        0x25 => 0xE04B,
+        0x27 => 0xE04D,
+        b'1'..=b'9' => u32::from(vk - b'1') + 2,
+        b'0' => 0x0B,
+        b'A'..=b'Z' => u32::from(LETTERS[usize::from(vk - b'A')]),
+        _ => 0,
+    }
+}
+
+/// No host input on macOS yet (it comes with a window); scripted keys in
+/// diagnostics builds.
 #[cfg(not(windows))]
 fn host() -> Box<dyn Source> {
     struct Nothing;
@@ -559,7 +625,17 @@ fn host() -> Box<dyn Source> {
             None
         }
         fn keys(&mut self) -> Vec<KeyState> {
-            Vec::new()
+            #[cfg(feature = "diagnostics")]
+            let down = scripted();
+            #[cfg(not(feature = "diagnostics"))]
+            let down: Vec<u8> = Vec::new();
+            down.into_iter()
+                .map(|vk| KeyState {
+                    scan_code: scan_code(vk),
+                    virtual_key: vk,
+                    ..Default::default()
+                })
+                .collect()
         }
         fn rumble(&mut self, _: usize, _: u16, _: u16) {}
     }
@@ -1243,48 +1319,6 @@ mod host {
             // SAFETY: a valid vibration; an empty slot just fails.
             unsafe { XInputSetState(slot as u32, &speeds) };
         }
-    }
-
-    /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
-    /// 0.2 s that long after input starts (`<from>-<to>:<key>`: all that
-    /// time), with or without focus. A key is a
-    /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
-    /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
-    #[cfg(feature = "diagnostics")]
-    fn scripted() -> Vec<u8> {
-        static SCRIPT: LazyLock<(Instant, Vec<(Duration, Duration, u8)>)> = LazyLock::new(|| {
-            let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
-            let keys = list.split(',').filter_map(|entry| {
-                let (at, key) = entry.split_once(':')?;
-                let vk = match key.trim() {
-                    "Enter" => 0x0D,
-                    "Esc" => 0x1B,
-                    "Tab" => 0x09,
-                    "Back" => 0x08,
-                    "Up" => 0x26,
-                    "Down" => 0x28,
-                    "Left" => 0x25,
-                    "Right" => 0x27,
-                    k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
-                        k.as_bytes()[0].to_ascii_uppercase()
-                    }
-                    _ => return None,
-                };
-                let time = |t: &str| Duration::try_from_secs_f64(t.trim().parse().ok()?).ok();
-                let (from, to) = match at.split_once('-') {
-                    Some((from, to)) => (time(from)?, time(to)?),
-                    None => (time(at)?, time(at)? + Duration::from_millis(200)),
-                };
-                Some((from, to, vk))
-            });
-            (Instant::now(), keys.collect())
-        });
-        let (start, keys) = &*SCRIPT;
-        let now = start.elapsed();
-        keys.iter()
-            .filter(|&&(from, to, _)| (from..to).contains(&now))
-            .map(|&(_, _, vk)| vk)
-            .collect()
     }
 
     /// The foreground window is one of ours (the title's or our fallback).
