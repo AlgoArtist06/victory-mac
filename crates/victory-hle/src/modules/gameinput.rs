@@ -620,14 +620,43 @@ fn scan_code(vk: u8) -> u32 {
     }
 }
 
-/// No host input on macOS yet (it comes with a window); scripted keys in
-/// diagnostics builds.
+/// Host input on macOS: controllers paired with the Mac, the keyboard in
+/// our window, and scripted keys in diagnostics builds.
 #[cfg(not(windows))]
 fn host() -> Box<dyn Source> {
     struct Nothing;
     impl Source for Nothing {
-        fn pad(&mut self, _: usize) -> Option<PadState> {
-            None
+        /// A controller paired with the Mac, by connection order.
+        fn pad(&mut self, slot: usize) -> Option<PadState> {
+            let p = victory_metal::pad(slot)?;
+            let buttons = [
+                (p.menu, MENU),
+                (p.view, VIEW),
+                (p.a, A),
+                (p.b, B),
+                (p.x, X),
+                (p.y, Y),
+                (p.up, UP),
+                (p.down, DOWN),
+                (p.left, LEFT),
+                (p.right, RIGHT),
+                (p.left_shoulder, LEFT_SHOULDER),
+                (p.right_shoulder, RIGHT_SHOULDER),
+                (p.left_stick, LEFT_STICK),
+                (p.right_stick, RIGHT_STICK),
+            ]
+            .iter()
+            .filter(|(on, _)| *on)
+            .fold(0, |all, (_, bit)| all | bit);
+            Some(PadState {
+                buttons,
+                left_trigger: p.left_trigger,
+                right_trigger: p.right_trigger,
+                left_x: p.left_x,
+                left_y: p.left_y,
+                right_x: p.right_x,
+                right_y: p.right_y,
+            })
         }
         fn keys(&mut self) -> Vec<KeyState> {
             #[cfg(feature = "diagnostics")]

@@ -11,6 +11,11 @@
 
 #[cfg(target_os = "macos")]
 mod mac;
+#[cfg(target_os = "macos")]
+mod pads;
+
+#[cfg(target_os = "macos")]
+pub use pads::{Pad, pad};
 
 #[cfg(target_os = "macos")]
 pub use mac::{keys_held, present, run_app};
